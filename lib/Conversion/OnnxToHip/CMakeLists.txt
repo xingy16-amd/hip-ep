@@ -65,6 +65,7 @@ add_library(OnnxToHip STATIC
   SinConversion.cpp
   CeilConversion.cpp
   RoundConversion.cpp
+  FloorConversion.cpp
   ExpConversion.cpp
   LogConversion.cpp
   CumSumConversion.cpp
