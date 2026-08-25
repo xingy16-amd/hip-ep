@@ -175,6 +175,13 @@ HIP_KERNEL_API int hip_elementwise_cos(
     int64_t num_elements,
     int hip_dtype);
 
+HIP_KERNEL_API int hip_elementwise_erf(
+    void* stream,
+    const void* input,
+    void* output,
+    int64_t num_elements,
+    int hip_dtype);
+
 HIP_KERNEL_API int hip_elementwise_sin(
     void* stream,
     const void* input,
@@ -780,6 +787,16 @@ HIP_KERNEL_API int hip_gqa_flash_prefill(
     int past_len, float scale, int local_window_size, const void* head_sink,
     int num_heads, int smooth_softmax);
 
+/* Lookup-only v3 variant. The final five fields are explicit launch
+ * parameters for v5/v7/v8 respectively; unused fields are zero. This entry
+ * validates the selected tuple and never invokes an online autotuner. */
+HIP_KERNEL_API int hip_gqa_flash_prefill_v3_configured(
+    void* stream, const void* Q, const void* Kcache, const void* Vcache,
+    void* O, int B, int Hq, int G, int sq, int skv, int d, int max_seq,
+    int past_len, float scale, int local_window_size, const void* head_sink,
+    int num_heads, int smooth_softmax,
+    int m_tiles, int bkv, int nw, int mt, int nd);
+
 /* NB: prefill is compute-bound, so there is deliberately NO separate int8
  * prefill kernel. The runtime (real/gqa.cpp) dequantizes the int8 KV cache to an
  * fp16 scratch ONCE (hip_gqa_dequant_kv_i8_to_fp16) and reuses the tuned fp16
@@ -861,6 +878,28 @@ HIP_KERNEL_API int hip_gqa_flash_decode(
     int kv_dtype,
     const void* k_scale,
     const void* v_scale);
+
+/* Lookup-only variant of hip_gqa_flash_decode. The caller supplies a
+ * validated offline-LUT or heuristic configuration, so this entry never runs
+ * the in-kernel autotuner. Environment force overrides remain available for
+ * development diagnostics. */
+HIP_KERNEL_API int hip_gqa_flash_decode_configured(
+    void* stream,
+    const void* Q, const void* Kcache, const void* Vcache,
+    void* O,
+    void* partials_workspace,
+    int B, int H, int G, int d, int skv, int max_seq, int max_splits,
+    float scale,
+    const void* seqlens_k,
+    int local_window_size,
+    const void* head_sink,
+    int use_smooth_softmax,
+    int kv_dtype,
+    const void* k_scale,
+    const void* v_scale,
+    int use_wmma,
+    int splits,
+    int bkv);
 
 /* =========================================================================
  * Cast (Element Type Conversion)
@@ -1163,6 +1202,34 @@ HIP_KERNEL_API int hip_resize(
     int mode,
     int coord_transform,
     int nearest_mode);
+
+/* =========================================================================
+ * GridSample (ONNX 4-D NCHW)
+ * =========================================================================
+ *
+ * Samples input (N, C, H_in, W_in) at normalized (x, y) locations from
+ * grid (N, H_out, W_out, 2). Output is (N, C, H_out, W_out).
+ *
+ *  mode:           0 = nearest, 1 = bilinear
+ *  padding_mode:   0 = zeros, 1 = border, 2 = reflection
+ *  align_corners:  0 or 1
+ *
+ * Supported hip_dtypes: HIP_DTYPE_FLOAT32, HIP_DTYPE_FLOAT16,
+ * HIP_DTYPE_BFLOAT16, HIP_DTYPE_FLOAT64.
+ * Returns: 0 on success, non-zero on failure.
+ */
+HIP_KERNEL_API int hip_grid_sample(
+    void* stream,
+    const void* input,
+    const void* grid,
+    void* output,
+    int64_t n, int64_t c,
+    int64_t in_h, int64_t in_w,
+    int64_t out_h, int64_t out_w,
+    int mode,
+    int padding_mode,
+    int align_corners,
+    int hip_dtype);
 
 /* =========================================================================
  * Global pool (avg / max / lp)
