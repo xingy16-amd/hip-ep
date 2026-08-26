@@ -200,6 +200,20 @@ HIP_KERNEL_API int hip_elementwise_exp(
     int64_t num_elements,
     int hip_dtype);
 
+HIP_KERNEL_API int hip_elementwise_sigmoid(
+    void* stream,
+    const void* input,
+    void* output,
+    int64_t num_elements,
+    int hip_dtype);
+
+HIP_KERNEL_API int hip_elementwise_tanh(
+    void* stream,
+    const void* input,
+    void* output,
+    int64_t num_elements,
+    int hip_dtype);
+
 HIP_KERNEL_API int hip_elementwise_log(
     void* stream,
     const void* input,
@@ -1571,6 +1585,29 @@ HIP_KERNEL_API int hip_layer_norm(
     float epsilon,
     int hip_dtype,
     int mean_dtype);
+
+/* =========================================================================
+ * InstanceNormalization
+ * =========================================================================
+ *
+ *   y = scale[c] * (x - mean) * rsqrt(var + epsilon) + bias[c]
+ *
+ * Mean/var over the spatial axes of each (N, C) slice. Input is
+ * (N, C, spatial) in row-major layout. Scale and bias are length C.
+ *
+ * `hip_dtype`: FLOAT16, BFLOAT16, FLOAT32, or FLOAT64.
+ */
+HIP_KERNEL_API int hip_instance_norm(
+    void* stream,
+    const void* input,
+    const void* scale,
+    const void* bias,
+    void* output,
+    int64_t n,
+    int64_t c,
+    int64_t spatial,
+    float epsilon,
+    int hip_dtype);
 
 /* =========================================================================
  * Range (1-D sequence generation)

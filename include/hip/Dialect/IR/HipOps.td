@@ -1248,6 +1248,52 @@ def Hip_LayerNormOp : Hip_DpsOp<"layer_norm",
   let hasVerifier = 1;
 }
 
+def Hip_InstanceNormOp : Hip_DpsOp<"instance_norm", /*traits=*/[],
+                                   /*outsAccessor=*/"Output",
+                                   /*autoReify=*/1,
+                                   /*autoInfer=*/1,
+                                   /*declareInfer=*/1> {
+  let summary = "ONNX InstanceNormalization (per-instance per-channel mean/var)";
+  let description = [{
+    Carries out instance normalization as described in
+    https://arxiv.org/abs/1607.08022 / ONNX InstanceNormalization:
+
+      y = scale * (x - mean) / sqrt(variance + epsilon) + B
+
+    Mean and variance are computed over the spatial axes of each (N, C)
+    slice. Input rank is at least 3: (N, C, D1, ..., Dn). Scale and B are
+    1-D tensors of length C.
+
+    Example:
+    ```mlir
+    hip.instance_norm(%ctx)
+        ins(%input, %scale, %bias :
+            memref<2x3x8x8xf32, 1>, memref<3xf32, 1>, memref<3xf32, 1>)
+        outs(%output : memref<2x3x8x8xf32, 1>)
+        {epsilon = 1.000000e-05 : f32}
+    ```
+  }];
+
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$input,
+    Hip_TensorOrMemRef:$scale,
+    Hip_TensorOrMemRef:$bias,
+    Hip_TensorOrMemRef:$output,
+    DefaultValuedAttr<F32Attr, "1.000000e-05">:$epsilon
+  );
+
+  let assemblyFormat = [{
+    `(` $ctx `)` `ins` `(`
+        $input `,` $scale `,` $bias `:`
+        type($input) `,` type($scale) `,` type($bias)
+    `)`
+    `outs` `(` $output `:` type($output) `)`
+    attr-dict (`:` type($result_tensors)^)?
+  }];
+  let hasVerifier = 1;
+}
+
 def Hip_SkipRmsNormOp : Hip_DpsOp<"skip_rms_norm",
     [AttrSizedOperandSegments, OpStateOpInterface]> {
   let summary = "Fused skip + RMS normalization (com.microsoft.SkipSimplifiedLayerNormalization)";
@@ -1919,28 +1965,16 @@ def Hip_SiluOp : Hip_DpsOp<"silu", /*traits=*/[],
   let hasVerifier = 1;
 }
 
-def Hip_SigmoidOp : Hip_DpsOp<"sigmoid", /*traits=*/[OpStateOpInterface],
+def Hip_SigmoidOp : Hip_DpsOp<"sigmoid", /*traits=*/[],
                               /*outsAccessor=*/"Y",
                               /*autoReify=*/1,
                               /*autoInfer=*/1,
                               /*declareInfer=*/1> {
   let summary = "Sigmoid activation";
-
-  // OpStateOpInterface: construct this instance's per-session ActivationState,
-  // which holds a shared_ptr to the device-wide MIOpen descriptor table shared
-  // across sessions via WeakStore. All three MIOpen activations (sigmoid, tanh,
-  // softplus) share the same construct + table.
-  let extraClassDeclaration = [{
-    ::mlir::Value generateOpStateInit(::mlir::OpBuilder &builder,
-                                      ::mlir::Location loc,
-                                      ::mlir::Value statePtr, int32_t slot) {
-      return ::mlir::hip::emitOpStateConstruct(
-          builder, loc, statePtr, slot,
-          "hipdnn_ep_op_state_construct_activation", {});
-    }
-  }];
   let description = [{
     Applies sigmoid activation: y = 1 / (1 + exp(-x))
+
+    Lowered via the unified unary elementwise path (wrap_sigmoid).
 
     Uses destination-passing style: output buffer is provided as argument.
 
@@ -1964,25 +1998,16 @@ def Hip_SigmoidOp : Hip_DpsOp<"sigmoid", /*traits=*/[OpStateOpInterface],
   }];
 }
 
-def Hip_TanhOp : Hip_DpsOp<"tanh", /*traits=*/[OpStateOpInterface],
+def Hip_TanhOp : Hip_DpsOp<"tanh", /*traits=*/[],
                            /*outsAccessor=*/"Y",
                            /*autoReify=*/1,
                            /*autoInfer=*/1,
                            /*declareInfer=*/1> {
   let summary = "Tanh activation";
-
-  // OpStateOpInterface: shared ActivationState (see hip.sigmoid).
-  let extraClassDeclaration = [{
-    ::mlir::Value generateOpStateInit(::mlir::OpBuilder &builder,
-                                      ::mlir::Location loc,
-                                      ::mlir::Value statePtr, int32_t slot) {
-      return ::mlir::hip::emitOpStateConstruct(
-          builder, loc, statePtr, slot,
-          "hipdnn_ep_op_state_construct_activation", {});
-    }
-  }];
   let description = [{
     Applies hyperbolic-tangent activation: y = tanh(x)
+
+    Lowered via the unified unary elementwise path (wrap_tanh).
 
     Uses destination-passing style: output buffer is provided as argument.
 
