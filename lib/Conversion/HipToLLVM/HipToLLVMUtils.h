@@ -158,8 +158,11 @@ inline constexpr int64_t kActivationSoftplus = 3;
 // com.amd QMoE (hip.qmoe_amd / wrap_qmoe_amd) activation and routing modes.
 // Values must match HIPDNN_EP_QMOE_AMD_* in lib/Runtime/hipdnn_ep_runtime.h.
 // Separate from kActivation* above, which mirrors the MIOpen activation set
-// and has no relu2.
+// and has no relu2. Unknown is emitted for a mode name the lowering does not
+// recognize; the runtime decides what is implemented and rejects the rest.
+inline constexpr int64_t kQMoEAmdActivationUnknown = -1;
 inline constexpr int64_t kQMoEAmdActivationRelu2 = 0;
+inline constexpr int64_t kQMoEAmdRoutingUnknown = -1;
 inline constexpr int64_t kQMoEAmdRoutingSigmoid = 0;
 
 // Window-pool reduction mode constants (hip.pool / wrap_pool).
