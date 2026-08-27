@@ -164,12 +164,6 @@ struct RuntimeState {
   // multi_head_attention instance owns one in its MhaState op-state slot (see
   // op_states below and docs/design/op-state-slots-design.md).
 
-  // NOTE: the CausalConvWithState MIOpen descriptor + algorithm cache
-  // (CausalConvCache) formerly lived here as causal_conv_cache, then moved to
-  // a per-op-instance CausalConvState op-state slot. It no longer exists at
-  // all: the op runs entirely on custom kernels, so there are no MIOpen
-  // descriptors to cache. See docs/design/op-state-slots-design.md.
-
   // Asym zero_points unpack cache (ZpUnpackCache*) used by wrap_qmoe.
   //
   // The asym AWQ path stores zero_points as packed nibbles [N, ceil(K/bs/2)].
