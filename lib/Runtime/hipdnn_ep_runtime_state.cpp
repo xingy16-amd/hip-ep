@@ -1557,6 +1557,22 @@ int hipdnn_ep_state_ensure_la_scratch(RuntimeState *state, size_t needed_size) {
   return 0;
 }
 
+void hipdnn_ep_state_record_error(RuntimeState *state, int status) {
+  if (status == 0)
+    return;
+  fprintf(stderr, "hipdnn runtime operator failed (rc=%d)\n", status);
+  if (!state || !state->device_error_flag || !state->stream)
+    return;
+  // Static storage remains alive until this asynchronous transfer completes.
+  // Every error writes the same nonzero value; successful calls never clear it.
+  static const int error = 1;
+  hipError_t rc = hipMemcpyAsync(state->device_error_flag, &error, sizeof(error),
+                                 hipMemcpyHostToDevice, state->stream);
+  if (rc != hipSuccess)
+    fprintf(stderr, "hipdnn runtime could not record operator error: %s\n",
+            hipGetErrorString(rc));
+}
+
 void *hipdnn_ep_state_get_error_flag_device_ptr(RuntimeState *state) {
   return state ? static_cast<void *>(state->device_error_flag) : nullptr;
 }

@@ -386,6 +386,7 @@ bool hipdnn_ep_op_states_alloc(RuntimeState *state, int64_t n);
 // Device-side runtime error flag (set by kernels, observed by wrappers).
 // Intended for operators that detect runtime-invalid inputs on GPU (e.g. Range
 // delta==0) and need to propagate an error code back through main_graph.
+void hipdnn_ep_state_record_error(RuntimeState *state, int status);
 void *hipdnn_ep_state_get_error_flag_device_ptr(RuntimeState *state);
 int hipdnn_ep_state_reset_error_flag(RuntimeState *state);
 int hipdnn_ep_state_read_and_clear_error_flag(RuntimeState *state);
@@ -1598,6 +1599,13 @@ int wrap_log(RuntimeState *state, void *input, void *output,
 // Computes output = lhs / rhs; materialises broadcast via hip_expand when
 // an operand shape differs from the output shape.
 int wrap_div(RuntimeState *state, void *lhs, void *rhs, void *output,
+             int64_t lhs_n, int64_t lhs_c, int64_t lhs_h, int64_t lhs_w,
+             int64_t rhs_n, int64_t rhs_c, int64_t rhs_h, int64_t rhs_w,
+             int64_t out_n, int64_t out_c, int64_t out_h, int64_t out_w,
+             int64_t data_type);
+
+// Signed atan2(lhs, rhs); f16/f32 and rank <= 4 broadcasting.
+int wrap_atan2(RuntimeState *state, void *lhs, void *rhs, void *output,
              int64_t lhs_n, int64_t lhs_c, int64_t lhs_h, int64_t lhs_w,
              int64_t rhs_n, int64_t rhs_c, int64_t rhs_h, int64_t rhs_w,
              int64_t out_n, int64_t out_c, int64_t out_h, int64_t out_w,

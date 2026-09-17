@@ -350,7 +350,7 @@ HIP_KERNEL_API int hip_elementwise_mod(
  * Replaces MIOpen's miopenOpTensor for the float/half path, which is
  * pathologically slow on gfx1151 for vision-encoder elementwise shapes.
  *
- *   op: 0 = add, 1 = mul, 2 = min, 3 = max
+ *   op: 0 = add, 1 = mul, 2 = min, 3 = max, 4 = atan2(lhs, rhs)
  *
  * Supported hip_dtype: HIP_DTYPE_FLOAT32, HIP_DTYPE_FLOAT16.
  * Returns: 0 on success, -1 on unsupported dtype / launch error, -2 when the

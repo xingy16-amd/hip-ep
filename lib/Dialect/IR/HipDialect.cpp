@@ -1691,6 +1691,63 @@ void GqaOp::getEffects(
 }
 
 LogicalResult GqaOp::verify() {
+  if (getRightPaddedPrefill()) {
+    auto q = dyn_cast<ShapedType>(getQuery().getType());
+    auto k = getKey() ? dyn_cast<ShapedType>(getKey().getType()) : ShapedType();
+    auto v = getValue() ? dyn_cast<ShapedType>(getValue().getType()) : ShapedType();
+    auto out = dyn_cast<ShapedType>(getOutput().getType());
+    if (!q || !q.hasRank() || q.getRank() != 3 || q.getDimSize(0) != 1 ||
+        !q.getElementType().isF16() || !k || !v || !k.hasRank() ||
+        !v.hasRank() || k.getRank() != 3 || v.getRank() != 3 ||
+        k.getShape() != v.getShape() || k.getDimSize(0) != 1 ||
+        k.getDimSize(1) != q.getDimSize(1) ||
+        !k.getElementType().isF16() || !v.getElementType().isF16() ||
+        !out || !out.hasRank() || out.getShape() != q.getShape() ||
+        !out.getElementType().isF16())
+      return emitOpError("right_padded_prefill requires batch=1, separate "
+                         "FP16 Q/K/V with equal sequence extents and matching output");
+    if (!q.hasStaticShape() || !k.hasStaticShape() || q.getDimSize(1) < 1 ||
+        getNumHeads() < 1 || getKvNumHeads() < 1 ||
+        getNumHeads() % getKvNumHeads() != 0 ||
+        q.getDimSize(2) < 1 || q.getDimSize(2) % getNumHeads() != 0 ||
+        k.getDimSize(2) != q.getDimSize(2) / getNumHeads() * getKvNumHeads())
+      return emitOpError("right_padded_prefill requires static positive Q/K/V "
+                         "shapes consistent with the head counts");
+    if (getNoCausal() || getDoRotary() || getPositionIds() ||
+        getCosCache() || getSinCache() || getAttentionBias() || getHeadSink() ||
+        getSmoothSoftmax() || !getSoftcap().isZero() || getQkOutput() ||
+        getOutputQk() || getKQuantType() != "NONE" || getVQuantType() != "NONE" ||
+        getKScale() || getVScale())
+      return emitOpError("right_padded_prefill requires causal attention, "
+                         "external RoPE and unquantized KV without bias/sink/QK output");
+    for (Value lengths : {getSeqlensK(), getTotalSeqLen()}) {
+      auto ty = dyn_cast<ShapedType>(lengths.getType());
+      if (!ty || !ty.hasStaticShape() || ty.getNumElements() != 1 ||
+          !ty.getElementType().isInteger(32))
+        return emitOpError("right_padded_prefill lengths must each contain one i32");
+    }
+    auto pk = dyn_cast<ShapedType>(getPresentKey().getType());
+    auto pv = dyn_cast<ShapedType>(getPresentValue().getType());
+    if (!pk || !pv || !pk.hasStaticShape() || !pv.hasStaticShape() ||
+        pk.getShape() != pv.getShape())
+      return emitOpError("right_padded_prefill present cache shapes must match");
+    if (bool(getPastKey()) != bool(getPastValue()))
+      return emitOpError("right_padded_prefill past key/value must be paired");
+    if (getPastKey() && getPastKey().getType() != getPastValue().getType())
+      return emitOpError("right_padded_prefill past cache types must match");
+    for (Value cache : {getPastKey(), getPastValue(), getPresentKey(),
+                        getPresentValue()}) {
+      if (!cache)
+        continue;
+      auto ty = dyn_cast<ShapedType>(cache.getType());
+      if (!ty || !ty.hasStaticShape() || ty.getRank() != 4 ||
+          ty.getDimSize(0) != 1 || ty.getDimSize(1) != getKvNumHeads() ||
+          ty.getDimSize(2) < 1 ||
+          ty.getDimSize(3) != q.getDimSize(2) / getNumHeads() ||
+          !ty.getElementType().isF16())
+        return emitOpError("right_padded_prefill requires matching static FP16 BNSH caches");
+    }
+  }
   // Verify quantization parameter consistency
   auto kQuantType = getKQuantType().str();
   auto vQuantType = getVQuantType().str();
@@ -1794,6 +1851,38 @@ void EqualOp::getEffects(
 //===----------------------------------------------------------------------===//
 // DivOp: ins(lhs, rhs), outs(output)
 //===----------------------------------------------------------------------===//
+
+MutableOperandRange Atan2Op::getDpsInitsMutable() { return getOutputMutable(); }
+
+void Atan2Op::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+LogicalResult Atan2Op::verify() {
+  auto output = cast<ShapedType>(getOutput().getType());
+  Type element = output.getElementType();
+  if (!element.isF16() && !element.isF32())
+    return emitOpError("requires f16 or f32 elements");
+  if (!output.hasRank() || output.getRank() > 4)
+    return emitOpError("requires ranked tensors/memrefs of rank at most 4");
+  for (Value input : {getLhs(), getRhs()}) {
+    auto type = cast<ShapedType>(input.getType());
+    if (!type.hasRank() || type.getRank() > output.getRank() ||
+        type.getElementType() != element)
+      return emitOpError(
+          "requires matching element types and broadcastable ranks");
+    for (int64_t i = 0; i < type.getRank(); ++i) {
+      int64_t in = type.getDimSize(i);
+      int64_t out = output.getDimSize(i + output.getRank() - type.getRank());
+      if (!ShapedType::isDynamic(in) && !ShapedType::isDynamic(out) &&
+          in != 1 && in != out)
+        return emitOpError("input shape cannot broadcast to output");
+    }
+  }
+  return success();
+}
 
 MutableOperandRange DivOp::getDpsInitsMutable() { return getOutputMutable(); }
 

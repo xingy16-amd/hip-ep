@@ -879,7 +879,7 @@ __device__ __forceinline__ void ew_store(__half *p, uint32_t i, float v) {
   p[i] = __float2half(v);
 }
 
-// op: 0=add, 1=mul, 2=min, 3=max
+// op: 0=add, 1=mul, 2=min, 3=max, 4=atan2(y, x)
 __device__ __forceinline__ float ew_apply(int op, float a, float b) {
   switch (op) {
   case 0:
@@ -888,8 +888,12 @@ __device__ __forceinline__ float ew_apply(int op, float a, float b) {
     return a * b;
   case 2:
     return a < b ? a : b;
-  default:
+  case 3:
     return a > b ? a : b;
+  case 4:
+    return atan2f(a, b);
+  default:
+    return nanf("");
   }
 }
 
