@@ -51,6 +51,7 @@ inline constexpr const char *kWrapStridedCopy = "wrap_strided_copy";
 inline constexpr const char *kWrapConv = "wrap_conv";
 inline constexpr const char *kWrapConvTranspose = "wrap_conv_transpose";
 inline constexpr const char *kWrapHipblasltMatmul = "wrap_hipblasLtMatmul";
+inline constexpr const char *kWrapRocMlir = "wrap_rocmlir";
 inline constexpr const char *kWrapRmsNorm = "wrap_rms_norm";
 inline constexpr const char *kWrapSkipSimplifiedLayerNorm =
     "wrap_skip_simplified_layer_norm";
@@ -74,6 +75,7 @@ inline constexpr const char *kWrapBiasGelu = "wrap_bias_gelu"; // hip.bias_gelu
 inline constexpr const char *kWrapFastGelu = "wrap_fast_gelu"; // hip.fast_gelu
 inline constexpr const char *kWrapLeakyRelu =
     "wrap_leaky_relu";                                        // hip.leaky_relu
+inline constexpr const char *kWrapSwish = "wrap_swish";       // hip.swish
 inline constexpr const char *kWrapSoftplus = "wrap_softplus"; // hip.softplus
 inline constexpr const char *kWrapElementwiseSub = "wrap_elementwise_sub";
 inline constexpr const char *kWrapRotaryEmbedding = "wrap_rotary_embedding";
@@ -140,6 +142,11 @@ inline constexpr const char *kWrapScatterND = "wrap_scatter_nd";
 inline constexpr const char *kWrapNonZero = "wrap_nonzero";
 inline constexpr const char *kWrapSize = "wrap_size";
 inline constexpr const char *kWrapQElementwise = "wrap_qelementwise";
+inline constexpr const char *kWrapQMatMul = "wrap_qmatmul";
+inline constexpr const char *kWrapQGemm = "wrap_qgemm";
+inline constexpr const char *kWrapQConv = "wrap_qconv";
+inline constexpr const char *kWrapQLpNormalization = "wrap_qlpnormalization";
+inline constexpr const char *kWrapQSigmoid = "wrap_qsigmoid";
 // Synchronize the stream and read a device i32 scalar back to the host
 // (used by hip.readback_dim to materialise a data-dependent dynamic dim).
 inline constexpr const char *kHipReadbackI32 = "hipdnn_ep_readback_i32";
@@ -387,6 +394,7 @@ inline SmallVector<Value, 4> extractShape4D(MemRefType type, Value descriptor,
 // Must match HIPDNN_EP_QELEMENTWISE_* in lib/Runtime/hipdnn_ep_runtime.h
 enum HipdnnQElementwiseKind : int64_t {
   kQElementwiseAdd = 0,
+  kQElementwiseMul = 1,
 };
 
 // Must match HIPDNN_EP_TENSOR_OP_* in lib/Runtime/hipdnn_ep_runtime.h
@@ -406,6 +414,8 @@ void populateConvTransposeLoweringPatterns(const LLVMTypeConverter &converter,
                                            RewritePatternSet &patterns);
 void populateMatmulLoweringPatterns(const LLVMTypeConverter &converter,
                                     RewritePatternSet &patterns);
+void populateRocMlirLoweringPatterns(const LLVMTypeConverter &converter,
+                                     RewritePatternSet &patterns);
 void populateElementwiseLoweringPatterns(const LLVMTypeConverter &converter,
                                          RewritePatternSet &patterns);
 void populatePowerLoweringPatterns(const LLVMTypeConverter &converter,
@@ -521,8 +531,18 @@ void populateGridSampleLoweringPatterns(const LLVMTypeConverter &converter,
                                         RewritePatternSet &patterns);
 void populateGlobalPoolLoweringPatterns(const LLVMTypeConverter &converter,
                                         RewritePatternSet &patterns);
-void populateQAddLoweringPatterns(const LLVMTypeConverter &converter,
-                                  RewritePatternSet &patterns);
+void populateQElementwiseLoweringPatterns(const LLVMTypeConverter &converter,
+                                          RewritePatternSet &patterns);
+void populateQMatMulLoweringPatterns(const LLVMTypeConverter &converter,
+                                     RewritePatternSet &patterns);
+void populateQGemmLoweringPatterns(const LLVMTypeConverter &converter,
+                                   RewritePatternSet &patterns);
+void populateQConvLoweringPatterns(const LLVMTypeConverter &converter,
+                                   RewritePatternSet &patterns);
+void populateQLpNormalizationLoweringPatterns(
+    const LLVMTypeConverter &converter, RewritePatternSet &patterns);
+void populateQSigmoidLoweringPatterns(const LLVMTypeConverter &converter,
+                                      RewritePatternSet &patterns);
 } // namespace hip
 } // namespace mlir
 

@@ -8,11 +8,17 @@
 // a = (A - z_a) * s_a
 // b = (B - z_b) * s_b
 // OUT = saturate(round((a [OP] b) / s_out) + z_out)
-// --->
+//
+// [OP] = Add:
 // let M_a = s_a/s_out, M_b = s_b/s_out
 // OUT = saturate(round(M_a * (A - z_a) [OP] M_b * (B - z_b)) + z_out)
+//
+// [OP] = Mul:
+// let M = s_a * s_b / s_out
+// OUT = saturate(round(M * (A - z_a) * (B - z_b)) + z_out)
 #include "../debug_log.h"
 #include "../hipdnn_ep_runtime.h"
+#include "../op_profile.h"
 #include "hip_custom_kernels.h"
 
 #include <cstdio>
@@ -34,17 +40,32 @@ static int hipdnn_to_hip_dtype_qelem(int64_t hipdnn_type) {
   }
 }
 
-// Notes on function reuse: the current function declaration does not support
-// multiplication or division because the formula optimization needs to be
-// modified. Additionally, the current function interface does not provide
-// sufficient information to support mixed quantization precisions. We can
-// update it if such a case arises.
+// Notes on function reuse: Mul reuses this Add-shaped declaration unchanged --
+// its three scales collapse into M_a, leaving M_b dead. One `data_type` covers
+// both operands and the output, so mixed precisions remain inexpressible.
 int wrap_qelementwise(RuntimeState *state, void *lhs, void *rhs, void *output,
                       int64_t kind, const int64_t *lhs_shape, int64_t lhs_rank,
                       const int64_t *rhs_shape, int64_t rhs_rank,
                       const int64_t *out_shape, int64_t out_rank,
                       int64_t data_type, float M_a, int64_t lhs_zp, float M_b,
                       int64_t rhs_zp, int64_t output_zp) {
+  // Kind-specific OP_PROFILE label so PERF rows separate qadd / qmul.
+  OP_PROFILE(
+      hipdnn_ep_qelementwise_kind_name(kind),
+      [&] {
+        char b[96];
+        int n =
+            snprintf(b, sizeof(b), "%s:", hipdnn_ep_datatype_name(data_type));
+        for (int64_t i = 0; out_shape && i < out_rank; ++i) {
+          if (n <= 0 || n >= static_cast<int>(sizeof(b)))
+            break;
+          n += snprintf(b + n, sizeof(b) - n, "%s%lld", i ? "x" : "",
+                        (long long)out_shape[i]);
+        }
+        return std::string(b);
+      },
+      state);
+
   if (!state || !lhs || !rhs || !output) {
     fprintf(stderr, "wrap_qelementwise: null tensor argument\n");
     return -1;

@@ -213,8 +213,11 @@ def HipsrExternalizeConstantsPass
     : Pass<"hipsr-externalize-constants", "mlir::ModuleOp"> {
   let summary = "Externalize hipsr.constant: stamp offset/size/index, write constants file";
   let description = [{
-    Externalizes each `hipsr.constant`: stamps `offset`/`size`/`index`.
-    With a FileSystem injected, also writes the constants file.
+    Gives each `hipsr.constant` an `index`, `offset`, and `size`.
+    When the module has constants, it sets `hip.constants_file`,
+    `hipdnn.constant_sizes`, and `hipdnn.constant_offsets`.
+    `--generate-interface` reads those attributes.
+    When a FileSystem is present, it writes the constants file.
   }];
   let options = [
     Option<"constantsFile", "constants-file", "std::string",
@@ -244,15 +247,44 @@ def HipsrPoolAllocPass : Pass<"hipsr-pool-alloc", "mlir::ModuleOp"> {
   ];
 }
 
+def HipsrInlineRegionsPass : Pass<"hipsr-inline-regions", "mlir::ModuleOp"> {
+  let summary = "Inline hipsr.pool_domain and hipsr.compute into their parents";
+  let description = [{
+    Flattens `hipsr.pool_domain` and `hipsr.compute` regions. Nested regions
+    are flattened from the inside out.
+
+    Before:
+    ```mlir
+    %r = hipsr.compute(%ctx) ins(%in) outs(%out) {
+    ^bb0(%c: !hipsr.context, %i: memref<4xf32>, %o: memref<4xf32>):
+      memref.copy %i, %o : memref<4xf32> to memref<4xf32>
+      hipsr.compute_yield %o : memref<4xf32>
+    } : memref<4xf32>
+    ```
+
+    After:
+    ```mlir
+    memref.copy %in, %out : memref<4xf32> to memref<4xf32>
+    ```
+  }];
+  let dependentDialects = [
+    "::mlir::hipsr::HipsrDialect"
+  ];
+}
+
 def HipsrUseOutputAllocatorPass
     : Pass<"hipsr-use-output-allocator", "mlir::func::FuncOp"> {
   let summary =
       "Rewrite returned memref.alloc outputs to hipsr.alloc_output";
   let description = [{
-    Replaces each graph-output `memref.alloc` with `hipsr.alloc_output`, reusing
-    the alloc's dynamic-size operands and setting `out_idx` to its position in
-    `func.return`. Output buffers then come from the EP output allocator and are
-    owned by the EP/runtime instead of being deallocated or pooled.
+    Replaces each graph-output `memref.alloc` with `hipsr.alloc_output`, taking
+    dynamic sizes from the allocation's `hipsr.preserve_shape` and setting
+    `out_idx` to its position in `func.return`. Output buffers then come from
+    the EP output allocator and are owned by the EP/runtime instead of being
+    deallocated or pooled.
+
+    Runs after bufferization, since a shape it reads must be an index memref,
+    and before `hipsr-pool-alloc`.
 
     An allocation counts as a graph output when `func.return` returns it either
     directly or through view-like aliases. The view operations are left in
@@ -263,6 +295,7 @@ def HipsrUseOutputAllocatorPass
     are skipped. The function signature and `func.return` are left unchanged.
   }];
   let dependentDialects = [
+    "::mlir::arith::ArithDialect",
     "::mlir::hipsr::HipsrDialect",
     "::mlir::memref::MemRefDialect"
   ];

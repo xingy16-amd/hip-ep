@@ -185,13 +185,6 @@ macro(compile_to_bitcode SOURCE_FILE OUTPUT_BC)
         list(APPEND COMPILE_FLAGS "-DHIPDNN_EP_DISABLE_VENDOR_BLAS")
     endif()
 
-    # Moves the GQA autotune default (autotune/gqa/gqa_autotune.cpp) from the
-    # offline LUT to online GPU benchmarking. Both paths stay compiled in either
-    # way; this is the lever for harnesses that cannot set HIPDNN_GQA_AUTOTUNE_MODE.
-    if(HIPDNN_EP_GQA_AUTOTUNE_ONLINE_DEFAULT)
-        list(APPEND COMPILE_FLAGS "-DHIPDNN_EP_GQA_AUTOTUNE_ONLINE_DEFAULT=1")
-    endif()
-
     # Always add root directory for public headers
     list(APPEND COMPILE_FLAGS "-I" "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -273,13 +266,13 @@ macro(compile_to_bitcode SOURCE_FILE OUTPUT_BC)
         DEPENDS ${SOURCE_FILE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/hipdnn_ep_runtime.h
                 ${CMAKE_SOURCE_DIR}/include/hip/datatype_abi.h
+                ${CMAKE_SOURCE_DIR}/include/hip/init_config_abi.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/runtime_state_internal.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/op_state.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/op_profile.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/chrome_trace.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/debug_log.h
                 ${IMPL_DEPS}
-                ${CMAKE_BINARY_DIR}/schemas/gqa_autotune_generated.h
                 ${CMAKE_BINARY_DIR}/schemas/model_metadata_generated.h
         COMMENT "Compiling ${SOURCE_FILE} to bitcode"
         VERBATIM
@@ -313,6 +306,7 @@ if(NOT BUILD_MOCK_RUNTIME)
     compile_to_bitcode(real/elementwise.cpp runtime_elementwise.bc)
     compile_to_bitcode(real/power.cpp runtime_power.bc)
     compile_to_bitcode(real/matmul.cpp runtime_matmul.bc)
+    compile_to_bitcode(real/rocmlir.cpp runtime_rocmlir.bc)
     compile_to_bitcode(real/activation.cpp runtime_activation.bc)
     compile_to_bitcode(real/bias_gelu.cpp runtime_bias_gelu.bc)
     compile_to_bitcode(real/fast_gelu.cpp runtime_fast_gelu.bc)
@@ -321,8 +315,6 @@ if(NOT BUILD_MOCK_RUNTIME)
     compile_to_bitcode(real/simplified_layer_norm.cpp runtime_simplified_layer_norm.bc)
     compile_to_bitcode(real/skip_simplified_layer_norm.cpp runtime_skip_simplified_layer_norm.bc)
     compile_to_bitcode(real/rotary_embedding.cpp runtime_rotary_embedding.bc)
-    # Host code, but it lives next to the kernels it configures.
-    compile_to_bitcode(Kernels/hip/autotune/gqa/gqa_autotune.cpp runtime_gqa_autotune.bc)
     compile_to_bitcode(real/gqa.cpp runtime_gqa.bc)
     compile_to_bitcode(real/cast.cpp runtime_cast.bc)
     compile_to_bitcode(real/range.cpp runtime_range.bc)
@@ -388,45 +380,11 @@ if(NOT BUILD_MOCK_RUNTIME)
     compile_to_bitcode(real/grid_sample.cpp runtime_grid_sample.bc)
     compile_to_bitcode(real/global_pool.cpp runtime_global_pool.bc)
     compile_to_bitcode(real/qelementwise.cpp runtime_qelementwise.bc)
-
-    # GQA offline-autotune LUT, embedded into runtime.bc so the JIT'd runtime
-    # always has it: it ships with the project build (inside runtime.bc), not
-    # with each model and not as a loose file the JIT loader cannot locate on
-    # disk. compatibleLut still gates it by GPU arch at load time, so a model
-    # that runs on a different arch simply falls through to the heuristic.
-    set(GQA_LUT_FB
-        ${CMAKE_CURRENT_SOURCE_DIR}/Kernels/hip/autotune/gqa/lut/gfx1151.fb)
-    set(GQA_LUT_PIC "")
-    if(NOT WIN32)
-        set(GQA_LUT_PIC "-fPIC")
-    endif()
-    add_custom_command(
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp
-        COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_SOURCE_DIR}/cmake/xxd.py
-                --var kGqaLutData_gfx1151
-                --output ${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp.tmp
-                ${GQA_LUT_FB}
-        # xxd.py emits a `static` array with a trailing padding byte; rewrite it
-        # to an extern "C" symbol and record the true byte count separately.
-        COMMAND ${Python3_EXECUTABLE} -c
-                "import os; data = open('${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp.tmp').read(); data = data.replace('static const unsigned char', 'extern \"C\" const unsigned char'); n = os.path.getsize('${GQA_LUT_FB}'); data = '#include <cstddef>\\n' + data + f'\\nextern \"C\" const size_t kGqaLutData_gfx1151_size = {n};\\n'; open('${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp', 'w').write(data)"
-        COMMAND ${CMAKE_COMMAND} -E remove
-                ${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp.tmp
-        DEPENDS ${GQA_LUT_FB} ${CMAKE_SOURCE_DIR}/cmake/xxd.py
-        COMMENT "Embedding GQA LUT (gfx1151.fb) into runtime.bc"
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa_lut_data.bc
-        COMMAND ${CLANG_EXECUTABLE}
-                -c -emit-llvm -std=c++17 ${GQA_LUT_PIC}
-                ${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp
-                -o ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa_lut_data.bc
-        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data.cpp
-        COMMENT "Compiling embedded GQA LUT to bitcode"
-        VERBATIM
-    )
+    compile_to_bitcode(real/qmatmul.cpp runtime_qmatmul.bc)
+    compile_to_bitcode(real/qgemm.cpp runtime_qgemm.bc)
+    compile_to_bitcode(real/qconv.cpp runtime_qconv.bc)
+    compile_to_bitcode(real/qlpnormalization.cpp runtime_qlpnormalization.bc)
+    compile_to_bitcode(real/qsigmoid.cpp runtime_qsigmoid.bc)
 
     set(RUNTIME_BC_MODULES
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_state.bc
@@ -443,6 +401,7 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_elementwise.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_power.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_matmul.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_rocmlir.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_activation.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_bias_gelu.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_fast_gelu.bc
@@ -451,7 +410,6 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_simplified_layer_norm.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_skip_simplified_layer_norm.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_rotary_embedding.bc
-        ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa_autotune.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_cast.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_range.bc
@@ -517,6 +475,11 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_gather_block_quantized.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_qdq.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_qelementwise.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_qmatmul.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_qgemm.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_qconv.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_qlpnormalization.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_qsigmoid.bc
     )
     # Vendor-symbol stubs (see the compile_to_bitcode above) join runtime.bc only
     # when the vendor BLAS/DNN backends are disabled.
@@ -524,9 +487,6 @@ if(NOT BUILD_MOCK_RUNTIME)
         list(APPEND RUNTIME_BC_MODULES
             ${CMAKE_CURRENT_BINARY_DIR}/runtime_vendor_blas_stub.bc)
     endif()
-    # Embedded GQA LUT bytes (defined by gqa_lut_data.cpp above).
-    list(APPEND RUNTIME_BC_MODULES
-        ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa_lut_data.bc)
 else()
     # Mock runtime for testing without GPU
     compile_to_bitcode(mock/mock_gpu.cpp runtime_mock.bc)

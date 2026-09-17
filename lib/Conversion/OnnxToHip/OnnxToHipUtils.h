@@ -456,6 +456,8 @@ void populateReluConversionPatterns(RewritePatternSet &patterns,
                                     MLIRContext *ctx);
 void populateLeakyReluConversionPatterns(RewritePatternSet &patterns,
                                          MLIRContext *ctx);
+void populateSwishConversionPatterns(RewritePatternSet &patterns,
+                                     MLIRContext *ctx);
 void populateClipConversionPatterns(RewritePatternSet &patterns,
                                     MLIRContext *ctx);
 void populatePoolConversionPatterns(RewritePatternSet &patterns,
@@ -471,6 +473,11 @@ void populateFlattenConversionPatterns(RewritePatternSet &patterns,
 
 void populateQdqConversionPatterns(RewritePatternSet &patterns,
                                    MLIRContext *ctx);
+
+/// Canonicalize com.microsoft QuantizeLinear / DequantizeLinear represented as
+/// onnx.Custom into native ONNX QDQ ops. Must run before the PDLL fusion pass.
+void populateCustomQdqCanonicalizationPatterns(RewritePatternSet &patterns,
+                                               MLIRContext *ctx);
 
 /// Pre-lowering pattern set: fold `Transpose(perm=[..,r,r-2])` into a
 /// consuming `onnx.MatMul` as `hipdnn.transA` / `hipdnn.transB` so the

@@ -1162,22 +1162,188 @@ extern "C" int hip_gqa_add_attention_bias_f32(
   GQA_RETURN_LAUNCH_STATUS();
 }
 
+// Highest key position any query row in a chunk can attend, read off the
+// additive mask instead of assumed.
+//
+// The decomposed prefill tiles the query range into chunks and gives each its
+// own key extent. For a causal op that extent is the chunk's own last row,
+// which is exact and needs no mask inspection. A BIDIRECTIONAL op
+// (onnx.Attention is_causal=0) has no such bound in its attributes, so every
+// chunk scores every key -- and on Gemma-4's 5 global layers that is the
+// largest single block of wasted work in a 16K prefill, because their mask is
+// causal apart from a same-image-block leg reaching one image block above the
+// diagonal. AttentionWindowFold cannot supply the bound: the block extent is a
+// property of the input, not of the mask's structure.
+//
+// The mask itself already carries it, exactly, for one streaming read. An entry
+// whose additive bias is at or below -65504 -- the fp16 lower bound, and the
+// sentinel HF exports write for "not attended" -- cannot survive the softmax:
+// relative to any score the GEMM ahead of it can produce, exp() of it
+// underflows to exactly zero. That is the same property the mask relies on to
+// mask at all, and softmax_f32_to_out_kernel above already documents this
+// value for the same reason. So dropping those key positions from a chunk's
+// range is bit-exact rather than an approximation, and anything less negative
+// than the sentinel is treated as attended, which only narrows less.
+//
+// Only the region ABOVE the chunk's last row is scanned. Keys at or below it
+// are kept whatever the mask says, so the answer is max(diagonal, highest
+// attended key above it) and the work is half the mask rather than all of it.
+// The max is reduced over every bias batch/head plane as well as every row in
+// the chunk, so a broadcast plane and a per-head mask both yield a bound valid
+// for all of them.
+#define GQA_BIAS_EXTENT_THREADS 256
+
+// Additive bias at or below this cannot survive the softmax. Not a tolerance:
+// it is the fp16 lower bound, which is the sentinel itself.
+#define GQA_BIAS_MASKED_MAX (-65504.0f)
+
+template <typename TBias>
+__global__ void bias_key_extent_kernel(
+    const TBias* __restrict__ bias, int* __restrict__ out,
+    int bias_batch, int bias_heads, int bias_sq, int bias_total_seq,
+    int sq, int sq_chunk, int past_len) {
+  const int chunk = blockIdx.x;
+  const int q0 = chunk * sq_chunk;
+  if (q0 >= sq)
+    return;
+  const int c = min(sq_chunk, sq - q0);
+
+  // Absolute key position of the chunk's last query row. Keys at or below it
+  // are attended by the causal leg and are never dropped, so it is the floor.
+  const int diag = past_len + q0 + c - 1;
+  int best = diag;
+
+  const int scan_lo = diag + 1;
+  if (scan_lo < bias_total_seq) {
+    const size_t plane = static_cast<size_t>(bias_sq) * bias_total_seq;
+    const int planes = bias_batch * bias_heads;
+    for (int p = 0; p < planes; ++p) {
+      for (int r = 0; r < c; ++r) {
+        const size_t row_base = static_cast<size_t>(p) * plane +
+                                static_cast<size_t>(q0 + r) * bias_total_seq;
+        // `k > best` first: once this thread has seen a high hit, the lower
+        // columns cannot raise the answer and the load is skipped.
+        for (int k = scan_lo + threadIdx.x; k < bias_total_seq;
+             k += blockDim.x) {
+          if (k > best &&
+              static_cast<float>(bias[row_base + k]) > GQA_BIAS_MASKED_MAX)
+            best = k;
+        }
+      }
+    }
+  }
+
+  __shared__ int red[GQA_BIAS_EXTENT_THREADS];
+  red[threadIdx.x] = best;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      red[threadIdx.x] = max(red[threadIdx.x], red[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    out[chunk] = red[0];
+}
+
+extern "C" int hip_gqa_bias_key_extent(
+    void* stream_ptr, const void* bias, void* out_chunk_hi,
+    int bias_batch, int bias_heads, int bias_sq, int bias_total_seq,
+    int sq, int sq_chunk, int past_len, int num_chunks,
+    int bias_element_size_bytes) {
+  if (!bias || !out_chunk_hi || num_chunks <= 0 || sq_chunk <= 0 ||
+      bias_total_seq <= 0 || bias_sq <= 0)
+    return -1;
+  hipStream_t stream = static_cast<hipStream_t>(stream_ptr);
+  if (bias_batch <= 0)
+    bias_batch = 1;
+  if (bias_heads <= 0)
+    bias_heads = 1;
+  (void)hipGetLastError();
+  if (bias_element_size_bytes == 2) {
+    bias_key_extent_kernel<__half>
+        <<<dim3(num_chunks), GQA_BIAS_EXTENT_THREADS, 0, stream>>>(
+            static_cast<const __half*>(bias), static_cast<int*>(out_chunk_hi),
+            bias_batch, bias_heads, bias_sq, bias_total_seq, sq, sq_chunk,
+            past_len);
+  } else if (bias_element_size_bytes == 4) {
+    bias_key_extent_kernel<float>
+        <<<dim3(num_chunks), GQA_BIAS_EXTENT_THREADS, 0, stream>>>(
+            static_cast<const float*>(bias), static_cast<int*>(out_chunk_hi),
+            bias_batch, bias_heads, bias_sq, bias_total_seq, sq, sq_chunk,
+            past_len);
+  } else {
+    fprintf(stderr, "hip_gqa_bias_key_extent: unsupported bias elem size %d\n",
+            bias_element_size_bytes);
+    return -1;
+  }
+  GQA_RETURN_LAUNCH_STATUS();
+}
+
 // Step 9b (fp32->fp16 variant): Softmax reading fp32 scores, writing fp16 output
 // Avoids inf-inf=NaN by operating entirely in fp32 before the final fp16 store.
 
 // Output-type-templated: reads fp32 scores, writes TOut ∈ {__half, float}.
 // fp16 output (TOut=__half) feeds the fp16 Value GEMM; fp32 output (TOut=float)
 // feeds the fp32 Value GEMM on the Whisper no_causal fp32 decomposed path.
-template <typename TOut>
+//
+// HAS_BIAS folds the external additive mask in here instead of running
+// add_attention_bias_kernel first. That kernel was a full read-modify-write
+// over the score buffer -- 2.14 GB per head at a 16K prompt -- purely to hand
+// this kernel a value it is about to read anyway. A block owns one query row,
+// and the bias runs along the key axis in the same order the reduction below
+// does, so the fold is one extra contiguous stream to read. The three passes
+// re-read it, but a row is 32-64 KB and stays resident across them, so the cost
+// is one stream from memory against the two the separate pass spent on the
+// scores alone.
+//
+// The bias is indexed on its own full extents rather than through a bumped
+// pointer, for the reason add_attention_bias_kernel gives at length: `input`
+// can be a sub-block of the logical [bias_sq, bias_total_seq] matrix -- `cols`
+// query rows from bias_row_offset when the caller tiles the prefill, and `rows`
+// key columns from bias_col_offset when it narrows to a sliding window -- while
+// the bias always describes the whole thing. Folding either offset into the
+// pointer would mis-stride every batch/head plane after the first.
+//
+// The bias is added to the score BEFORE the max is taken, which is required
+// rather than incidental: taking the max of unbiased scores and then adding the
+// bias could leave a masked entry (bias -65504) as the column max and put every
+// exponent off scale.
+template <typename TOut, bool HAS_BIAS = false, typename TBias = __half>
 __global__ void softmax_f32_to_out_kernel(
     const float* input, TOut* output,
     int rows, int cols, int input_batch_stride, int output_batch_stride,
-    const __half* head_sink, int num_heads, int use_smooth_softmax) {
+    const __half* head_sink, int num_heads, int use_smooth_softmax,
+    const TBias* __restrict__ bias, int bias_batch, int bias_heads,
+    int bias_sq, int bias_row_offset, int bias_total_seq, int bias_col_offset) {
   const int linear = __builtin_amdgcn_readfirstlane(blockIdx.x);
   const int head = __builtin_amdgcn_readfirstlane(linear / cols);
   const int col  = __builtin_amdgcn_readfirstlane(linear % cols);
   const float* in_col = input + (size_t)head * input_batch_stride + (size_t)col * rows;
   TOut* out_col = output + (size_t)head * output_batch_stride + (size_t)col * rows;
+
+  // Start of this query row inside the bias, resolved exactly as
+  // add_attention_bias_kernel resolves it. `col` is the query row (this kernel
+  // reduces along `rows`, the key axis), so it indexes the bias's row axis.
+  const TBias* bias_row = nullptr;
+  if (HAS_BIAS) {
+    const int b = head / num_heads;
+    const int h = head % num_heads;
+    const int bias_b = (bias_batch == 1) ? 0 : b;
+    const int bias_h = (bias_heads == 1) ? 0 : h;
+    const size_t bias_plane = (size_t)bias_sq * bias_total_seq;
+    bias_row = bias + (size_t)bias_b * bias_heads * bias_plane +
+               (size_t)bias_h * bias_plane +
+               (size_t)(bias_row_offset + col) * bias_total_seq +
+               bias_col_offset;
+  }
+
+  // Score with the bias already folded in, or the raw score when there is none.
+  auto score_at = [&](int i) -> float {
+    float s = in_col[i];
+    if (HAS_BIAS)
+      s += static_cast<float>(bias_row[i]);
+    return s;
+  };
 
   const int tid = threadIdx.x;
   const int wave_id = tid / WAVE_SIZE;
@@ -1188,7 +1354,7 @@ __global__ void softmax_f32_to_out_kernel(
   // Pass 1: find max (fp32, no overflow risk)
   float local_max = -INFINITY;
   for (int i = tid; i < rows; i += blockDim.x)
-    local_max = fmaxf(local_max, in_col[i]);
+    local_max = fmaxf(local_max, score_at(i));
 
   local_max = warp_reduce_max(local_max);
   if (tid % WAVE_SIZE == 0)
@@ -1206,7 +1372,7 @@ __global__ void softmax_f32_to_out_kernel(
   // Pass 2: exp2f + sum (fp32 throughout, values recomputed in Pass 3)
   float local_sum = 0.0f;
   for (int i = tid; i < rows; i += blockDim.x)
-    local_sum += exp2f((in_col[i] - max_val) * LOG2E);
+    local_sum += exp2f((score_at(i) - max_val) * LOG2E);
 
   local_sum = warp_reduce_sum(local_sum);
   if (tid % WAVE_SIZE == 0)
@@ -1232,17 +1398,19 @@ __global__ void softmax_f32_to_out_kernel(
   // Pass 3: normalize and write output (fp16 or fp32 per TOut).
   float inv_sum = 1.0f / sum_val;
   for (int i = tid; i < rows; i += blockDim.x) {
-    float e = exp2f((in_col[i] - max_val) * LOG2E);
+    float e = exp2f((score_at(i) - max_val) * LOG2E);
     out_col[i] = gqa_from_float<TOut>(e * inv_sum);
   }
 }
 
-template <typename TOut>
+template <typename TOut, bool HAS_BIAS, typename TBias>
 static void launch_softmax_f32_to_out(
     hipStream_t stream, const void* input_f32, void* output,
     int total_head_queries, int rows, int cols,
     int input_batch_stride, int output_batch_stride,
-    const void* head_sink, int num_heads, int use_smooth_softmax) {
+    const void* head_sink, int num_heads, int use_smooth_softmax,
+    const void* bias, int bias_batch, int bias_heads,
+    int bias_sq, int bias_row_offset, int bias_total_seq, int bias_col_offset) {
   // The block must be a whole multiple of the hardware wave, else the tail of a
   // partial wave is inactive and the __shfl_xor reduction folds in its lanes.
   // The floor is therefore the device wave size: 32 on wave32 (RDNA, unchanged
@@ -1254,11 +1422,27 @@ static void launch_softmax_f32_to_out(
   while (threads < std::min(rows, 256)) threads *= 2;
   if (threads > 256) threads = 256;
   int num_waves = threads / wave;
-  softmax_f32_to_out_kernel<TOut><<<total_head_queries, threads,
-                                    num_waves * sizeof(float), stream>>>(
-      static_cast<const float*>(input_f32), static_cast<TOut*>(output),
-      rows, cols, input_batch_stride, output_batch_stride,
-      static_cast<const __half*>(head_sink), num_heads, use_smooth_softmax);
+  softmax_f32_to_out_kernel<TOut, HAS_BIAS, TBias>
+      <<<total_head_queries, threads, num_waves * sizeof(float), stream>>>(
+          static_cast<const float*>(input_f32), static_cast<TOut*>(output),
+          rows, cols, input_batch_stride, output_batch_stride,
+          static_cast<const __half*>(head_sink), num_heads, use_smooth_softmax,
+          static_cast<const TBias*>(bias), bias_batch, bias_heads, bias_sq,
+          bias_row_offset, bias_total_seq, bias_col_offset);
+}
+
+// Selects the no-bias instantiation, so the existing callers stay on exactly
+// the code they had.
+template <typename TOut>
+static void launch_softmax_f32_to_out(
+    hipStream_t stream, const void* input_f32, void* output,
+    int total_head_queries, int rows, int cols,
+    int input_batch_stride, int output_batch_stride,
+    const void* head_sink, int num_heads, int use_smooth_softmax) {
+  launch_softmax_f32_to_out<TOut, false, __half>(
+      stream, input_f32, output, total_head_queries, rows, cols,
+      input_batch_stride, output_batch_stride, head_sink, num_heads,
+      use_smooth_softmax, nullptr, 1, 1, 0, 0, 0, 0);
 }
 
 extern "C" int hip_gqa_softmax_f32_to_f16(
@@ -1289,6 +1473,58 @@ extern "C" int hip_gqa_softmax_f32_to_f32(
       stream, input_f32, output_f32, total_head_queries, rows, cols,
       input_batch_stride, output_batch_stride, head_sink, num_heads,
       use_smooth_softmax);
+  GQA_RETURN_LAUNCH_STATUS();
+}
+
+// Bias-folding variant: adds the external additive mask while reading the score
+// column, replacing a separate hip_gqa_add_attention_bias_f32 pass over the
+// same buffer. bias_element_size_bytes selects the mask dtype (2 = fp16, the
+// usual ONNX Attention export; 4 = fp32). output_fp32 picks the probability
+// dtype, matching the two entries above. The bias extents follow
+// hip_gqa_add_attention_bias_f32, including its convention that a
+// non-positive bias_sq / bias_total_seq means the bias covers exactly the block
+// passed in; note this kernel's `cols` is the query count and `rows` the key
+// extent, the transpose of the names that entry uses.
+extern "C" int hip_gqa_softmax_f32_to_out_biased(
+    void* stream_ptr, const void* input_f32, void* output,
+    int total_head_queries, int rows, int cols,
+    int input_batch_stride, int output_batch_stride,
+    const void* head_sink, int num_heads, int use_smooth_softmax,
+    const void* bias, int bias_batch, int bias_heads,
+    int bias_element_size_bytes, int output_fp32,
+    int bias_sq, int bias_row_offset, int bias_total_seq, int bias_col_offset) {
+  if (!bias)
+    return -1;
+  hipStream_t stream = static_cast<hipStream_t>(stream_ptr);
+  (void)hipGetLastError();  // clear stale error for correct attribution
+  if (bias_element_size_bytes != 2 && bias_element_size_bytes != 4) {
+    fprintf(stderr,
+            "hip_gqa_softmax_f32_to_out_biased: unsupported bias elem size %d\n",
+            bias_element_size_bytes);
+    return -1;
+  }
+  if (bias_sq <= 0)
+    bias_sq = cols;
+  if (bias_total_seq <= 0)
+    bias_total_seq = rows;
+#define GQA_SOFTMAX_BIASED(TOUT, TBIAS)                                        \
+  launch_softmax_f32_to_out<TOUT, true, TBIAS>(                                \
+      stream, input_f32, output, total_head_queries, rows, cols,               \
+      input_batch_stride, output_batch_stride, head_sink, num_heads,           \
+      use_smooth_softmax, bias, bias_batch, bias_heads, bias_sq,               \
+      bias_row_offset, bias_total_seq, bias_col_offset)
+  if (output_fp32) {
+    if (bias_element_size_bytes == 2)
+      GQA_SOFTMAX_BIASED(float, __half);
+    else
+      GQA_SOFTMAX_BIASED(float, float);
+  } else {
+    if (bias_element_size_bytes == 2)
+      GQA_SOFTMAX_BIASED(__half, __half);
+    else
+      GQA_SOFTMAX_BIASED(__half, float);
+  }
+#undef GQA_SOFTMAX_BIASED
   GQA_RETURN_LAUNCH_STATUS();
 }
 
@@ -2241,7 +2477,7 @@ static inline void launchFlashDecodeConfig(
   const bool use_wmma = cfg.use_wmma && flash_decode_wmma_supported(d, hpg);
   // Diagnostic: print the config actually launched (works in both lookup and
   // online/autotune modes) so a run can be diffed against the other mode.
-  static const bool s_log_cfg = getenv("HIPDNN_EP_GQA_LOG_CONFIG") != nullptr;
+  static const bool s_log_cfg = gqa_autotune_log_enabled() || custom_kernels_debug_enabled();
   if (s_log_cfg)
     fprintf(stderr,
             "[gqa-cfg] decode B=%d H=%d G=%d d=%d hpg=%d maxseq=%d -> "
@@ -3184,7 +3420,7 @@ static inline void dispatchPrefillV5(
     const _Float16* head_sink, int num_heads, int smooth_softmax,
     int local_window_size)
 {
-    static const bool s_log_cfg = getenv("HIPDNN_EP_GQA_LOG_CONFIG") != nullptr;
+    static const bool s_log_cfg = gqa_autotune_log_enabled() || custom_kernels_debug_enabled();
     if (s_log_cfg)
         fprintf(stderr,
                 "[gqa-cfg] prefill v5 B=%d H=%d G=%d d=%d sq=%d skv=%d -> "
@@ -3203,9 +3439,6 @@ static inline void dispatchPrefillV5(
                 scale, ablate, head_sink, num_heads, smooth_softmax,            \
                 local_window_size)
 
-    // Only d == 64 gets windowed instantiations: hip_gqa_flash_prefill
-    // rejects a window at any other head dim, so d == 128 with a window would
-    // be dead code.
     if (d == 64) {
         if (local_window_size > 0) {
             if (m_tiles == 2 && bkv == 64)  LAUNCH_V5(2, 64, 64, true);
@@ -3219,10 +3452,17 @@ static inline void dispatchPrefillV5(
             else                            LAUNCH_V5(1, 32, 64, false);
         }
     } else {
-        if (m_tiles == 2 && bkv == 64)      LAUNCH_V5(2, 64, 128, false);
-        else if (m_tiles == 2)              LAUNCH_V5(2, 32, 128, false);
-        else if (bkv == 64)                 LAUNCH_V5(1, 64, 128, false);
-        else                                LAUNCH_V5(1, 32, 128, false);
+        if (local_window_size > 0) {
+            if (m_tiles == 2 && bkv == 64)  LAUNCH_V5(2, 64, 128, true);
+            else if (m_tiles == 2)          LAUNCH_V5(2, 32, 128, true);
+            else if (bkv == 64)             LAUNCH_V5(1, 64, 128, true);
+            else                            LAUNCH_V5(1, 32, 128, true);
+        } else {
+            if (m_tiles == 2 && bkv == 64)  LAUNCH_V5(2, 64, 128, false);
+            else if (m_tiles == 2)          LAUNCH_V5(2, 32, 128, false);
+            else if (bkv == 64)             LAUNCH_V5(1, 64, 128, false);
+            else                            LAUNCH_V5(1, 32, 128, false);
+        }
     }
     #undef LAUNCH_V5
 }
@@ -3550,7 +3790,7 @@ static inline void dispatchPrefillV7(
     _Float16* O, int B, int Hq, int G, int sq, int skv, int max_seq,
     int past_len, float scale)
 {
-    static const bool s_log_cfg = getenv("HIPDNN_EP_GQA_LOG_CONFIG") != nullptr;
+    static const bool s_log_cfg = gqa_autotune_log_enabled() || custom_kernels_debug_enabled();
     if (s_log_cfg)
         fprintf(stderr,
                 "[gqa-cfg] prefill v7 B=%d H=%d G=%d d=%d sq=%d skv=%d -> "
@@ -4005,7 +4245,7 @@ static inline void dispatchPrefillV8(
     _Float16* O, int B, int Hq, int G, int sq, int skv, int max_seq,
     int past_len, float scale)
 {
-    static const bool s_log_cfg = getenv("HIPDNN_EP_GQA_LOG_CONFIG") != nullptr;
+    static const bool s_log_cfg = gqa_autotune_log_enabled() || custom_kernels_debug_enabled();
     if (s_log_cfg)
         fprintf(stderr,
                 "[gqa-cfg] prefill v8 B=%d H=%d G=%d d=%d sq=%d skv=%d -> "
@@ -4303,12 +4543,11 @@ extern "C" void hip_gqa_flash_prefill_v8_set_ablate(int mask) {
 // on top of v2. v2 stays the narrow ABI so the standalone harnesses and shim
 // headers that redeclare it keep linking unchanged.
 //
-// Both features are implemented for d == 64 (the v5 kernel) only. For any other
-// d we return -1 rather than silently ignoring them, so the runtime keeps
-// routing those shapes to the decomposed path, which does implement both. A
-// request carrying neither is forwarded to v2 and keeps v2's head-dim coverage
-// and its v5/v7/v8 selection; d == 64 lands on v5 either way, so a sink or a
-// window never changes which kernel runs.
+// Attention sinks are implemented for d == 64. Sliding-window attention is
+// also implemented for d == 128 by v5. Unsupported feature/head
+// combinations return -1 rather than silently dropping the requested feature.
+// A request carrying neither is forwarded to v2 and keeps v2's head-dim
+// coverage and its v5/v7/v8 selection.
 extern "C" int hip_gqa_flash_prefill(
     void* stream_ptr,
     const void* Q, const void* Kcache, const void* Vcache, void* O,
@@ -4318,10 +4557,16 @@ extern "C" int hip_gqa_flash_prefill(
 {
     const bool wants_sink   = (head_sink != nullptr) || (smooth_softmax != 0);
     const bool wants_window = local_window_size > 0;
-    if ((wants_sink || wants_window) && d != 64) return -1;
+    if (wants_sink && d != 64) return -1;
+    if (wants_window && d != 64 && d != 128) return -1;
     if (!wants_sink && !wants_window) {
         return hip_gqa_flash_prefill_v2(stream_ptr, Q, Kcache, Vcache, O, B, Hq,
                                         G, sq, skv, d, max_seq, past_len, scale);
+    }
+    if (d == 128) {
+        return prefillV5Run(stream_ptr, Q, Kcache, Vcache, O, B, Hq, G, sq,
+                            skv, d, max_seq, past_len, scale, nullptr, Hq, 0,
+                            local_window_size);
     }
     return prefillV5Run(stream_ptr, Q, Kcache, Vcache, O, B, Hq, G, sq, skv, d,
                         max_seq, past_len, scale, head_sink, num_heads,
@@ -4382,7 +4627,8 @@ extern "C" int hip_gqa_flash_prefill_v3_configured(
 {
     const bool wants_sink = head_sink != nullptr || smooth_softmax != 0;
     const bool wants_window = local_window_size > 0;
-    if ((wants_sink || wants_window) && d != 64) return -1;
+    if (wants_sink && d != 64) return -1;
+    if (wants_window && d != 64 && d != 128) return -1;
 
     hipStream_t stream = static_cast<hipStream_t>(stream_ptr);
     const _Float16* Q_ptr = static_cast<const _Float16*>(Q);
@@ -4405,6 +4651,13 @@ extern "C" int hip_gqa_flash_prefill_v3_configured(
         return 0;
     }
     if (d == 128) {
+        if (wants_window) {
+            if (bkv != 32 && bkv != 64) return -1;
+            dispatchPrefillV5(1, bkv, d, stream, Q_ptr, K_ptr, V_ptr, O_ptr,
+                              B, Hq, G, sq, skv, max_seq, past_len, scale,
+                              nullptr, Hq, 0, local_window_size);
+            return 0;
+        }
         PrefillV7Cfg candidates[12];
         const int count = prefillV7Candidates(d, candidates);
         bool valid = false;

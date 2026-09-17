@@ -130,6 +130,10 @@ extern "C" const char *hipGetErrorString(hipError_t error) {
   return "mock_error";
 }
 
+// No mock call ever fails, so the last-error slot is always clear. Runtime
+// code still reads it to keep launch-status attribution honest on real HIP.
+extern "C" hipError_t hipGetLastError() { return hipSuccess; }
+
 // Mock HIP memory functions (non-static for cross-module linking)
 extern "C" hipError_t hipMalloc(void **ptr, size_t size) {
   *ptr = malloc(size);
@@ -455,6 +459,29 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
   return 0;
 }
 
+// RocMLIR dispatch (hip.rocmlir). Empty for now: the generated IR builds the
+// kernargs buffer and passes the embedded GPU binary + launch geometry, but
+// this wrapper does not yet load the module or launch the kernel.
+int wrap_rocmlir(RuntimeState *state, const char *kernel_binary,
+                 char *func_name, int64_t block_size, int64_t grid_size,
+                 void *kernargs, size_t size) {
+  (void)kernel_binary;
+  (void)func_name;
+  (void)block_size;
+  (void)grid_size;
+  (void)kernargs;
+  (void)size;
+  if (!state) {
+    fprintf(stderr, "Invalid state in wrap_rocmlir\n");
+    return -1;
+  }
+  MOCK_PRINT("[MOCK] wrap_rocmlir(func=%s, block_size=%lld, grid_size=%lld, "
+             "kernargs_size=%zu)\n",
+             func_name ? func_name : "(null)", (long long)block_size,
+             (long long)grid_size, size);
+  return 0;
+}
+
 int wrap_group_query_attention(
     RuntimeState *state, int op_state_slot,
     // Inputs 1-7 (core GQA)
@@ -476,7 +503,10 @@ int wrap_group_query_attention(
     // Shape values (6)
     int64_t batch_size, int64_t seq_len_q, int64_t seq_len_kv,
     int64_t past_buf_seq, int64_t head_dim, int64_t element_size_bytes,
-    int64_t attn_bias_batch, int64_t attn_bias_num_heads) {
+    int64_t attn_bias_batch, int64_t attn_bias_num_heads,
+    // key/value layout: 0 = rank-3 BSHD, 1 = rank-4 BNSD (mock stub ignores
+    // it).
+    int64_t kv_bnsd) {
   if (!state) {
     fprintf(stderr, "Invalid state in wrap_group_query_attention\n");
     return -1;
@@ -500,6 +530,7 @@ int wrap_group_query_attention(
   (void)present_value;
   (void)attn_bias_batch;
   (void)attn_bias_num_heads;
+  (void)kv_bnsd;
 
   MOCK_PRINT("[MOCK] wrap_group_query_attention(\n");
   MOCK_PRINT("[MOCK]   num_heads=%lld, kv_num_heads=%lld,\n",
@@ -1127,6 +1158,20 @@ int wrap_leaky_relu(RuntimeState *state, void *input, void *output,
   return 0;
 }
 
+int wrap_swish(RuntimeState *state, void *input, void *output,
+               int64_t num_elements, int64_t data_type, double alpha) {
+  if (!state) {
+    fprintf(stderr, "Invalid state in wrap_swish\n");
+    return -1;
+  }
+
+  MOCK_PRINT("[MOCK] wrap_swish(num_elements=%lld, data_type=%s(%lld), "
+             "alpha=%f)\n",
+             (long long)num_elements, hipdnn_ep_datatype_name(data_type),
+             (long long)data_type, alpha);
+  return 0;
+}
+
 // Mock impl of the runtime symbol referenced by the hip.miopen.softmax
 // lowering. Signature must match lib/Runtime/real/activation.cpp.
 extern "C" int hip_miopen_softmax(RuntimeState *state, const void *input,
@@ -1169,19 +1214,19 @@ int wrap_rotary_embedding(RuntimeState *state, void *input, void *position_ids,
 
 int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
                   int64_t input_num_elements, int64_t scale_num_elements,
-                  int64_t element_size_bytes, int64_t axis, float epsilon,
-                  int64_t stash_type) {
+                  int64_t norm_num_elements, int64_t element_size_bytes,
+                  int64_t axis, float epsilon, int64_t stash_type) {
   if (!state) {
     fprintf(stderr, "Invalid state in wrap_rms_norm\n");
     return -1;
   }
 
   MOCK_PRINT("[MOCK] wrap_rms_norm(input_num_elements=%lld, "
-             "scale_num_elements=%lld, element_size=%lld, axis=%lld, "
-             "epsilon=%f, stash_type=%lld)\n",
+             "scale_num_elements=%lld, norm_num_elements=%lld, "
+             "element_size=%lld, axis=%lld, epsilon=%f, stash_type=%lld)\n",
              (long long)input_num_elements, (long long)scale_num_elements,
-             (long long)element_size_bytes, (long long)axis, (double)epsilon,
-             (long long)stash_type);
+             (long long)norm_num_elements, (long long)element_size_bytes,
+             (long long)axis, (double)epsilon, (long long)stash_type);
 
   return 0;
 }
@@ -1213,8 +1258,9 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
                       const void *bias, void *output, int64_t M, int64_t N,
                       int64_t K, int64_t batch_count, int64_t bits,
                       int64_t block_size, int64_t elem_size,
-                      int64_t zp_elem_size) {
+                      int64_t zp_elem_size, int64_t scale_elem_size) {
   (void)op_state_slot;
+  (void)scale_elem_size;
   if (!state) {
     fprintf(stderr, "Invalid state in wrap_matmul_nbits\n");
     return -1;
@@ -1589,6 +1635,133 @@ int wrap_qelementwise(RuntimeState *state, void *lhs, void *rhs, void *output,
   if (!state)
     return -1;
   MOCK_PRINT("[MOCK] wrap_qelementwise,kind=%lld", (long long)kind);
+  return 0;
+}
+
+int wrap_qmatmul(RuntimeState *state, const void *A, const void *B, void *Y,
+                 const void *B_scales, const void *B_zero_points, int64_t M,
+                 int64_t N, int64_t K, int64_t batch_count,
+                 int64_t b_batch_stride, int64_t trans_a, int64_t trans_b,
+                 int64_t a_data_type, int64_t b_data_type, int64_t y_data_type,
+                 int64_t b_bits, float M_scale, float AY_ratio,
+                 int64_t A_zero_point, int64_t B_zero_point,
+                 int64_t Y_zero_point) {
+  (void)A;
+  (void)B;
+  (void)Y;
+  (void)B_zero_points;
+  (void)b_batch_stride;
+  (void)a_data_type;
+  (void)b_data_type;
+  (void)y_data_type;
+  (void)AY_ratio;
+  (void)A_zero_point;
+  (void)B_zero_point;
+  (void)Y_zero_point;
+  if (!state)
+    return -1;
+  MOCK_PRINT("[MOCK] wrap_qmatmul(M=%lld, N=%lld, K=%lld, batch=%lld, "
+             "trans=(%lld,%lld), b_bits=%lld, per_column=%d, M_scale=%g)",
+             (long long)M, (long long)N, (long long)K, (long long)batch_count,
+             (long long)trans_a, (long long)trans_b, (long long)b_bits,
+             B_scales != nullptr, (double)M_scale);
+  return 0;
+}
+
+int wrap_qgemm(RuntimeState *state, const void *A, const void *B, const void *C,
+               const void *B_scales, const void *B_zero_points, void *Y,
+               int64_t M, int64_t N, int64_t K, int64_t trans_a,
+               int64_t trans_b, int64_t a_data_type, int64_t b_data_type,
+               int64_t c_data_type, int64_t y_data_type, int64_t b_bits,
+               int64_t c_dim0, int64_t c_dim1, float M_ab, float M_c,
+               int64_t A_zero_point, int64_t B_zero_point, int64_t C_zero_point,
+               int64_t Y_zero_point) {
+  (void)A;
+  (void)B;
+  (void)B_zero_points;
+  (void)Y;
+  (void)c_data_type;
+  (void)c_dim0;
+  (void)c_dim1;
+  (void)M_c;
+  (void)A_zero_point;
+  (void)B_zero_point;
+  (void)C_zero_point;
+  (void)Y_zero_point;
+  if (!state)
+    return -1;
+  MOCK_PRINT("[MOCK] wrap_qgemm(M=%lld, N=%lld, K=%lld, trans=(%lld,%lld), "
+             "%s/%s->%s, b_bits=%lld, per_channel=%s, bias=%s, M_ab=%g)",
+             (long long)M, (long long)N, (long long)K, (long long)trans_a,
+             (long long)trans_b, hipdnn_ep_datatype_name(a_data_type),
+             hipdnn_ep_datatype_name(b_data_type),
+             hipdnn_ep_datatype_name(y_data_type), (long long)b_bits,
+             B_scales ? "yes" : "no", C ? "yes" : "null", (double)M_ab);
+  return 0;
+}
+
+int wrap_qconv(RuntimeState *state, const void *input, const void *weights,
+               const void *weight_scales, const void *weight_zero_points,
+               const void *bias, void *output, int64_t batch,
+               int64_t in_channels, int64_t out_channels, int64_t spatial_size,
+               int64_t activation_dtype, int64_t weight_dtype,
+               int64_t weight_bits, int64_t bias_dtype, float input_scale,
+               int64_t input_zp, float output_scale, int64_t output_zp) {
+  (void)input;
+  (void)weights;
+  (void)weight_scales;
+  (void)weight_zero_points;
+  (void)bias;
+  (void)output;
+  (void)bias_dtype;
+  (void)input_scale;
+  (void)input_zp;
+  (void)output_scale;
+  (void)output_zp;
+  if (!state)
+    return -1;
+  MOCK_PRINT("[MOCK] wrap_qconv N=%lld K=%lld M=%lld P=%lld act=%s w=%s "
+             "w_bits=%lld\n",
+             (long long)batch, (long long)in_channels, (long long)out_channels,
+             (long long)spatial_size, hipdnn_ep_datatype_name(activation_dtype),
+             hipdnn_ep_datatype_name(weight_dtype), (long long)weight_bits);
+  return 0;
+}
+
+int wrap_qlpnormalization(RuntimeState *state, const void *input, void *output,
+                          int64_t num_elements, int64_t norm_num_elements,
+                          int64_t data_type, float input_scale,
+                          int64_t input_zp, float output_scale,
+                          int64_t output_zp, int64_t axis, int64_t p) {
+  (void)input;
+  (void)output;
+  (void)input_scale;
+  (void)input_zp;
+  (void)output_scale;
+  (void)output_zp;
+  if (!state)
+    return -1;
+  MOCK_PRINT("[MOCK] wrap_qlpnormalization numel=%lld N=%lld dtype=%s "
+             "axis=%lld p=%lld\n",
+             (long long)num_elements, (long long)norm_num_elements,
+             hipdnn_ep_datatype_name(data_type), (long long)axis, (long long)p);
+  return 0;
+}
+
+int wrap_qsigmoid(RuntimeState *state, const void *input, void *output,
+                  int64_t num_elements, int64_t data_type, float input_scale,
+                  int64_t input_zp, float output_scale, int64_t output_zp) {
+  (void)input;
+  (void)output;
+  (void)input_scale;
+  (void)input_zp;
+  (void)output_scale;
+  (void)output_zp;
+  if (!state)
+    return -1;
+  MOCK_PRINT("[MOCK] wrap_qsigmoid(num_elements=%lld, data_type=%s(%lld))\n",
+             (long long)num_elements, hipdnn_ep_datatype_name(data_type),
+             (long long)data_type);
   return 0;
 }
 

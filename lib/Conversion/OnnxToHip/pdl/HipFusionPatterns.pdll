@@ -11,9 +11,42 @@
 // included exactly once.
 //===----------------------------------------------------------------------===//
 
-// Native constraints (implemented in qdq_fusion_pass.hpp)
-Constraint GetContextArg(op: Op) -> Value;
-Constraint ExtractScaleValue(val: Value) -> Attr;
-Constraint ExtractZeropointValue(op: Op, index: Attr, defaultValue: Attr) -> Attr;
+// Native helpers (implemented in qdq_fusion_pass.hpp).
+//
+// Fusability is decided by result-free constraints and the values are produced
+// by rewrites. Returning a result from a constraint shared by two patterns
+// rooted at the same op makes the PDL module fail to lower ("operand does not
+// dominate this use"), so nothing below may move back into the match section.
+Constraint HasContextArg(op: Op);
+Constraint IsSplatConstantValue(val: Value);
+Constraint HasExtractableZeropoint(op: Op, index: Attr);
+Constraint IsEightBitQuantized(op: Op);
+Constraint IsEightOrSixteenBitQuantized(op: Op);
+Constraint IsEightSixteenOrThirtyTwoBitQuantized(op: Op);
+Constraint HasStaticShapedResults(op: Op);
+Constraint HasAttrInt64Equal(op: Op, name: Attr, expected: Attr, absentValue: Attr);
+Constraint IsPerAxisQuantizedWeight(op: Op, rank: Attr, axis: Attr, bits: Attr);
+Constraint IsUint16Quantized(op: Op);
+Constraint IsFusableQConvGeometry(op: Op);
+Constraint IsPackedInt4PerChannelWeight(op: Op);
+Constraint HasMatchingSisoQParams(dq: Op, siso: Op, q: Op);
+Constraint IsPerChannelWeight(dequant: Op, consumer: Op);
+Constraint IsFusableQLpNormalization(op: Op);
+Constraint IsFusableQSigmoid(op: Op);
+
+Rewrite GetContextArg(op: Op) -> Value;
+Rewrite ExtractScaleValue(val: Value) -> Attr;
+Rewrite ExtractZeropointValue(op: Op, index: Attr, defaultValue: Attr) -> Attr;
+Rewrite ExtractQuantBits(val: Value) -> Attr;
+Rewrite ExtractAttrInt64(op: Op, name: Attr, defaultValue: Attr) -> Attr;
+Rewrite ExtractAttrF32(op: Op, name: Attr, defaultValue: Attr) -> Attr;
+Rewrite CreateQuantizedSiso(dq: Op, siso: Op, q: Op) -> Value;
 
 #include "QDQAddFusion.pdll"
+#include "QDQMulFusion.pdll"
+#include "QDQMatMulFusion.pdll"
+#include "QDQGemmFusion.pdll"
+#include "QDQConvFusion.pdll"
+#include "QDQSisoFusion.pdll"
+#include "QDQLpNormalizationFusion.pdll"
+#include "QDQSigmoidFusion.pdll"
