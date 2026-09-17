@@ -2458,6 +2458,31 @@ def Hip_DivOp : Hip_DpsOp_Broadcast<"div", /*operandGetters=*/["Lhs", "Rhs"]> {
   }];
 }
 
+def Hip_Atan2Op : Hip_DpsOp_Broadcast<"atan2", /*operandGetters=*/["Lhs", "Rhs"]> {
+  let summary = "Elementwise atan2(lhs, rhs), with lhs=y and rhs=x";
+  let description = [{
+    Computes the signed angle atan2(y, x) with NumPy-style broadcasting.
+    Supports f16/f32 tensors of rank at most 4. Half inputs are promoted to
+    float for atan2f and rounded once on output. Preserves signed-zero axis
+    conventions, handles infinities, and propagates NaNs. In particular,
+    atan2(+0, +0) = +0 and atan2(+0, -0) = +pi.
+  }];
+  let hasVerifier = 1;
+
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$lhs,
+    Hip_TensorOrMemRef:$rhs,
+    Hip_TensorOrMemRef:$output
+  );
+
+  let assemblyFormat = [{
+    `(` $ctx `)` `ins` `(` $lhs `,` $rhs `:` type($lhs) `,` type($rhs) `)`
+    `outs` `(` $output `:` type($output) `)`
+    attr-dict (`:` type($result_tensors)^)?
+  }];
+}
+
 def Hip_EqualOp : Hip_DpsOp_Broadcast<"equal", /*operandGetters=*/["Lhs", "Rhs"]> {
   let summary = "Element-wise equality comparison: c = (a == b)";
   let description = [{
@@ -3463,7 +3488,14 @@ def Hip_GqaOp : Hip_DpsOp<"gqa",
     // Whisper / bidirectional-attention enabler: when true, the causal mask
     // step in the runtime is skipped. Default false preserves all existing
     // Llama / gpt-oss callers' behaviour.
-    DefaultValuedAttr<BoolAttr, "false">:$no_causal
+    DefaultValuedAttr<BoolAttr, "false">:$no_causal,
+
+    // Explicit first-prefill contract, not inferred from tensor contents:
+    // B=1; separate contiguous FP16 Q/K/V; valid tokens occupy [0,L),
+    // L=seqlens_k[0]+1=total_seq_len, 1<=L<=S, and no past tokens are valid.
+    // RoPE must be applied externally. Output rows [L,S) are zero; only
+    // present-cache positions [0,L) are valid. Old calls keep their semantics.
+    DefaultValuedAttr<BoolAttr, "false">:$right_padded_prefill
   );
 
   let assemblyFormat = [{

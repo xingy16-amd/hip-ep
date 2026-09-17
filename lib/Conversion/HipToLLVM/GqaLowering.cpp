@@ -261,8 +261,11 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
         i64Type  // kv_bnsd
     };
 
+    StringRef wrapper = op.getRightPaddedPrefill()
+                            ? "wrap_group_query_attention_right_padded_prefill"
+                            : kWrapGQA;
     FailureOr<LLVM::LLVMFuncOp> funcOp =
-        LLVM::lookupOrCreateFn(rewriter, module, kWrapGQA, paramTypes, i32Type);
+        LLVM::lookupOrCreateFn(rewriter, module, wrapper, paramTypes, i32Type);
     if (failed(funcOp))
       return failure();
 
@@ -284,7 +287,16 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
         batchSizeVal, seqLenQVal, seqLenKVVal, pastBufSeqVal, headDimVal,
         elemSizeVal, attnBiasBatchVal, attnBiasNumHeadsVal, kvBnsdVal};
 
-    LLVM::CallOp::create(rewriter, loc, *funcOp, args);
+    Value status = LLVM::CallOp::create(rewriter, loc, *funcOp, args).getResult();
+    // main_graph returns void. Publish failures through the error flag that
+    // inference_compute checks after synchronizing, instead of discarding rc.
+    auto recordError = LLVM::lookupOrCreateFn(
+        rewriter, module, "hipdnn_ep_state_record_error",
+        ArrayRef<Type>{ptrType, i32Type}, LLVM::LLVMVoidType::get(getContext()));
+    if (failed(recordError))
+      return failure();
+    LLVM::CallOp::create(rewriter, loc, *recordError,
+                        ValueRange{statePtr, status});
 
     rewriter.eraseOp(op);
     return success();

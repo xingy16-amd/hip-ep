@@ -2992,3 +2992,70 @@ int wrap_group_query_attention(
             rc);
   return rc;
 }
+
+
+// An opt-in ABI entry keeps the original GQA ABI/semantics unchanged. B=1
+// contiguous BSHD tensors have a contiguous valid prefix even when S>L, so
+// reusing the existing kernels with sq=L needs no packing or stride changes.
+// Never infer this contract from zero-valued data or from a negative past_len.
+extern "C" int wrap_group_query_attention_right_padded_prefill(
+    RuntimeState *state, int op_state_slot,
+    void *query, void *key, void *value, void *past_key, void *past_value,
+    void *seqlens_k, void *total_seq_len,
+    void *cos_cache, void *sin_cache, void *position_ids,
+    void *attention_bias, void *head_sink, void *k_scale, void *v_scale,
+    void *output, void *present_key, void *present_value, void *output_qk,
+    int64_t num_heads, int64_t kv_num_heads, float scale, int64_t do_rotary,
+    int64_t rotary_interleaved, float softcap, int64_t local_window_size,
+    int64_t smooth_softmax, int64_t qk_output, int64_t k_quant_type,
+    int64_t v_quant_type, int64_t kv_cache_bit_width, int32_t no_causal,
+    int64_t batch_size, int64_t seq_len_q, int64_t seq_len_kv,
+    int64_t past_buf_seq, int64_t head_dim, int64_t element_size_bytes,
+    int64_t attn_bias_batch, int64_t attn_bias_num_heads) {
+  if (!state || !query || !key || !value || !output || !seqlens_k ||
+      !total_seq_len || !present_key || !present_value || batch_size != 1 ||
+      seq_len_q < 1 || seq_len_kv < 1 || num_heads < 1 || kv_num_heads < 1 ||
+      num_heads % kv_num_heads || head_dim < 1 || element_size_bytes != 2 ||
+      no_causal || do_rotary || cos_cache || sin_cache || position_ids ||
+      attention_bias || head_sink || k_scale || v_scale || smooth_softmax ||
+      softcap != 0 || qk_output || output_qk || k_quant_type || v_quant_type) {
+    fprintf(stderr, "GQA right_padded_prefill: unsupported arguments; requires "
+                    "batch=1, separate FP16 Q/K/V, causal attention and external RoPE\n");
+    return -1;
+  }
+  hipStream_t stream = static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state));
+  int32_t last_key = -1, total = 0;
+  if (hipMemcpyAsync(&last_key, seqlens_k, sizeof(last_key),
+                     hipMemcpyDeviceToHost, stream) != hipSuccess ||
+      hipMemcpyAsync(&total, total_seq_len, sizeof(total),
+                     hipMemcpyDeviceToHost, stream) != hipSuccess ||
+      hipStreamSynchronize(stream) != hipSuccess)
+    return -1;
+  const int64_t valid = static_cast<int64_t>(last_key) + 1;
+  if (valid < 1 || valid > seq_len_q || valid > seq_len_kv || total != valid) {
+    fprintf(stderr, "GQA right_padded_prefill: invalid lengths "
+                    "(seqlens_k=%d total=%d query_capacity=%lld cache_capacity=%lld); "
+                    "requires 1 <= seqlens_k+1 == total <= both capacities\n",
+            last_key, total, (long long)seq_len_q, (long long)seq_len_kv);
+    return -1;
+  }
+  RUNTIME_DEBUG_LOG("[REAL] GQA right_padded_prefill: capacity=%lld valid=%lld past=0\n",
+                    (long long)seq_len_q, (long long)valid);
+  int rc = wrap_group_query_attention(
+      state, op_state_slot, query, key, value, past_key, past_value,
+      seqlens_k, total_seq_len, cos_cache, sin_cache, position_ids,
+      attention_bias, head_sink, k_scale, v_scale, output, present_key,
+      present_value, output_qk, num_heads, kv_num_heads, scale, do_rotary,
+      rotary_interleaved, softcap, local_window_size, smooth_softmax, qk_output,
+      k_quant_type, v_quant_type, kv_cache_bit_width, no_causal,
+      batch_size, valid, seq_len_kv, past_buf_seq, head_dim, element_size_bytes,
+      attn_bias_batch, attn_bias_num_heads);
+  if (rc != 0)
+    return rc;
+  const size_t token_bytes = static_cast<size_t>(num_heads) * head_dim * 2;
+  if (valid < seq_len_q &&
+      hipMemsetAsync(static_cast<char *>(output) + valid * token_bytes, 0,
+                     (seq_len_q - valid) * token_bytes, stream) != hipSuccess)
+    return -1;
+  return 0;
+}

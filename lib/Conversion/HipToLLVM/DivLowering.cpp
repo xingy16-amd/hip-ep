@@ -9,24 +9,26 @@ namespace mlir {
 namespace hip {
 namespace {
 
-// hip.div(ctx, lhs, rhs, output)
-//   -> wrap_div(state, lhs, rhs, output,
+// hip.div / hip.atan2(ctx, lhs, rhs, output)
+//   -> wrap_div / wrap_atan2(state, lhs, rhs, output,
 //               lhs_n, lhs_c, lhs_h, lhs_w,
 //               rhs_n, rhs_c, rhs_h, rhs_w,
 //               out_n, out_c, out_h, out_w,
 //               data_type)
 //
 // Full 4D shapes enable runtime broadcast materialisation via hip_expand
-// before the flat hip_elementwise_div kernel (rank <= 4, left-padded with 1).
-struct DivOpLowering : public ConvertOpToLLVMPattern<DivOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+// before division; atan2 broadcasts directly in the kernel. Rank <= 4.
+template <typename Op>
+struct BinaryBroadcastOpLowering : public ConvertOpToLLVMPattern<Op> {
+  using ConvertOpToLLVMPattern<Op>::ConvertOpToLLVMPattern;
+  using OpAdaptor = typename Op::Adaptor;
 
   LogicalResult
-  matchAndRewrite(DivOp op, OpAdaptor adaptor,
+  matchAndRewrite(Op op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    Type ptrType = getPtrType();
+    ModuleOp module = op->template getParentOfType<ModuleOp>();
+    Type ptrType = this->getPtrType();
     Type i32Type = rewriter.getI32Type();
     Type i64Type = rewriter.getI64Type();
 
@@ -59,8 +61,10 @@ struct DivOpLowering : public ConvertOpToLLVMPattern<DivOp> {
     SmallVector<Type, 17> paramTypes(4, ptrType);
     paramTypes.append(13, i64Type);
 
-    FailureOr<LLVM::LLVMFuncOp> funcOp =
-        LLVM::lookupOrCreateFn(rewriter, module, kWrapDiv, paramTypes, i32Type);
+    FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
+        rewriter, module,
+        isa<Atan2Op>(op.getOperation()) ? "wrap_atan2" : kWrapDiv, paramTypes,
+        i32Type);
     if (failed(funcOp))
       return failure();
 
@@ -84,7 +88,8 @@ struct DivOpLowering : public ConvertOpToLLVMPattern<DivOp> {
 
 void populateDivLoweringPatterns(const LLVMTypeConverter &converter,
                                  RewritePatternSet &patterns) {
-  patterns.add<DivOpLowering>(converter);
+  patterns.add<BinaryBroadcastOpLowering<DivOp>,
+               BinaryBroadcastOpLowering<Atan2Op>>(converter);
 }
 
 } // namespace hip
