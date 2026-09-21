@@ -3049,7 +3049,10 @@ extern "C" int wrap_group_query_attention_right_padded_prefill(
       rotary_interleaved, softcap, local_window_size, smooth_softmax, qk_output,
       k_quant_type, v_quant_type, kv_cache_bit_width, no_causal,
       batch_size, valid, seq_len_kv, past_buf_seq, head_dim, element_size_bytes,
-      attn_bias_batch, attn_bias_num_heads);
+      // kv_bnsd selects the staging for a rank-4 BNSD key/value, which is read
+      // only on the no_causal path. This entry rejects no_causal above, so the
+      // source is always BSHD and the flag never reaches a use.
+      attn_bias_batch, attn_bias_num_heads, /*kv_bnsd=*/0);
   if (rc != 0)
     return rc;
   const size_t token_bytes = static_cast<size_t>(num_heads) * head_dim * 2;
