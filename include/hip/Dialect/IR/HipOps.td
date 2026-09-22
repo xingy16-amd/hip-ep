@@ -2458,31 +2458,6 @@ def Hip_DivOp : Hip_DpsOp_Broadcast<"div", /*operandGetters=*/["Lhs", "Rhs"]> {
   }];
 }
 
-def Hip_Atan2Op : Hip_DpsOp_Broadcast<"atan2", /*operandGetters=*/["Lhs", "Rhs"]> {
-  let summary = "Elementwise atan2(lhs, rhs), with lhs=y and rhs=x";
-  let description = [{
-    Computes the signed angle atan2(y, x) with NumPy-style broadcasting.
-    Supports f16/f32 tensors of rank at most 4. Half inputs are promoted to
-    float for atan2f and rounded once on output. Preserves signed-zero axis
-    conventions, handles infinities, and propagates NaNs. In particular,
-    atan2(+0, +0) = +0 and atan2(+0, -0) = +pi.
-  }];
-  let hasVerifier = 1;
-
-  let arguments = (ins
-    Hip_ContextType:$ctx,
-    Hip_TensorOrMemRef:$lhs,
-    Hip_TensorOrMemRef:$rhs,
-    Hip_TensorOrMemRef:$output
-  );
-
-  let assemblyFormat = [{
-    `(` $ctx `)` `ins` `(` $lhs `,` $rhs `:` type($lhs) `,` type($rhs) `)`
-    `outs` `(` $output `:` type($output) `)`
-    attr-dict (`:` type($result_tensors)^)?
-  }];
-}
-
 def Hip_EqualOp : Hip_DpsOp_Broadcast<"equal", /*operandGetters=*/["Lhs", "Rhs"]> {
   let summary = "Element-wise equality comparison: c = (a == b)";
   let description = [{
@@ -3488,14 +3463,7 @@ def Hip_GqaOp : Hip_DpsOp<"gqa",
     // Whisper / bidirectional-attention enabler: when true, the causal mask
     // step in the runtime is skipped. Default false preserves all existing
     // Llama / gpt-oss callers' behaviour.
-    DefaultValuedAttr<BoolAttr, "false">:$no_causal,
-
-    // Explicit first-prefill contract, not inferred from tensor contents:
-    // B=1; separate contiguous FP16 Q/K/V; valid tokens occupy [0,L),
-    // L=seqlens_k[0]+1=total_seq_len, 1<=L<=S, and no past tokens are valid.
-    // RoPE must be applied externally. Output rows [L,S) are zero; only
-    // present-cache positions [0,L) are valid. Old calls keep their semantics.
-    DefaultValuedAttr<BoolAttr, "false">:$right_padded_prefill
+    DefaultValuedAttr<BoolAttr, "false">:$no_causal
   );
 
   let assemblyFormat = [{
@@ -4826,15 +4794,23 @@ def Hip_QuantizeLinearOp : Hip_DpsOp<"quantize_linear", /*traits=*/[],
     the quantization granularity. The quantization formula is
     y = saturate((x / y_scale) + y_zero_point).
 
-    `packed_int4` marks an ONNX INT4 / UINT4 target. `$output` and
-    `$zero_point` keep their i8 / ui8 element type and logical shape, but only
-    the first ceil(numel/2) bytes of `$output` are written: two values per
-    byte, low nibble first, over the flattened row-major sequence. The buffer
-    is still allocated at the logical element count, so its upper half is left
-    untouched, and only a `packed_int4` consumer reads the result correctly.
-    Nothing sets this today -- unlike a packed constant, a 4-bit target leaves
-    no trace in the IR to detect -- and whatever does must first establish that
-    every consumer can be marked as well.
+    `packed_bits` names a sub-byte target: 4 for ONNX INT4 / UINT4, 2 for a
+    2-bit one, and 0 - the default - for a payload that occupies whole bytes.
+    `$output` and `$zero_point` keep their i8 / ui8 element type and logical
+    shape, but only the first ceil(numel * packed_bits / 8) bytes of `$output`
+    are written: 8 / packed_bits values per byte, least significant field
+    first, over the flattened row-major sequence. The buffer is still
+    allocated at the logical element count, so its tail is left untouched, and
+    only a consumer reading the same width recovers the values.
+
+    The width has to be stated rather than derived: every sub-byte payload
+    carries an i8 / ui8 element type at its logical extent, so a 2-bit and a
+    4-bit tensor of the same length are indistinguishable by type, differing
+    only in a byte count the type does not record.
+
+    Nothing sets this today -- unlike a packed constant, a sub-byte target
+    leaves no trace in the IR to detect -- and whatever does must first
+    establish that every consumer can be marked as well.
   }];
 
   let arguments = (ins
@@ -4847,7 +4823,7 @@ def Hip_QuantizeLinearOp : Hip_DpsOp<"quantize_linear", /*traits=*/[],
     I64Attr:$block_size,
     I64Attr:$precision,
     I64Attr:$saturate,
-    UnitAttr:$packed_int4
+    DefaultValuedAttr<I64Attr, "0">:$packed_bits
   );
 
   let assemblyFormat = [{
@@ -4875,14 +4851,24 @@ def Hip_DequantizeLinearOp : Hip_DpsOp<"dequantize_linear", /*traits=*/[],
     or have a rank identical to the input for blocked quantization.
     See QuantizeLinear for details on quantization granularity.
 
-    `packed_int4` marks an ONNX INT4 / UINT4 source. Those import as i8 / ui8
-    at the LOGICAL element count while `$input` and `$zero_point` only hold
-    ceil(numel/2) bytes, two values per byte, low nibble first, over the
-    flattened row-major sequence. The element type keeps the signedness but
-    cannot express the width, so without this flag a consumer reads twice the
-    buffer. `$output` and every shape stay logical, so nothing else changes.
-    Set by convert-onnx-to-hip from the marker that constant lowering stamps
-    on the ONNX op once it sees the halved backing size.
+    `packed_bits` names a sub-byte source: 4 for ONNX INT4 / UINT4, 2 for a
+    2-bit one, and 0 - the default - for a payload that occupies whole bytes.
+    Those import as i8 / ui8 at the LOGICAL element count while `$input` and
+    `$zero_point` only hold ceil(numel * packed_bits / 8) bytes, 8 /
+    packed_bits values per byte, least significant field first, over the
+    flattened row-major sequence.
+
+    The element type keeps the signedness but cannot express the width, and
+    neither can the extent, which stays logical: a 2-bit and a 4-bit tensor of
+    the same length have the same type and differ only in a byte count no
+    operand records. Stating the width is therefore the only way a consumer
+    can read the buffer at all, and the only way one that folds this op into a
+    wider one - `hip.matmul_nbits`, whose own `bits` attribute this feeds -
+    can know what it is folding.
+
+    `$output` and every shape stay logical, so nothing else changes. Set by
+    convert-onnx-to-hip from the marker that constant lowering stamps on the
+    ONNX op once it sees the reduced backing size.
   }];
 
   let arguments = (ins
@@ -4893,7 +4879,7 @@ def Hip_DequantizeLinearOp : Hip_DpsOp<"dequantize_linear", /*traits=*/[],
     Hip_TensorOrMemRef:$output,
     I64Attr:$axis,
     I64Attr:$block_size,
-    UnitAttr:$packed_int4
+    DefaultValuedAttr<I64Attr, "0">:$packed_bits
   );
 
   let assemblyFormat = [{

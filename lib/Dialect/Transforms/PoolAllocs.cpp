@@ -112,7 +112,7 @@ static int64_t staticFactorBytes(MemRefType type) {
     if (!ShapedType::isDynamic(dim))
       staticElems *= dim;
   return static_cast<int64_t>(
-      staticElems * llvm::divideCeil(type.getElementTypeBitWidth(), 8));
+      llvm::divideCeil(staticElems * type.getElementTypeBitWidth(), 8));
 }
 
 /// Max-load lower bound: the peak sum of `sizeOf` over members live at a single
@@ -707,20 +707,6 @@ void PoolAllocsPass::runOnOperation() {
     return signalPassFailure();
   }
 
-  // A RuntimeState owns the pools for the entire module, including outlined
-  // loop/if helpers. Function-local domain 0 must not alias its caller's live
-  // tensors. Interleave local domain IDs by the stable function ordinal;
-  // single-function modules retain their existing IDs and layout.
-  int64_t functionCount = 0, functionIndex = 0;
-  for (auto sibling :
-       funcOp->getParentOfType<ModuleOp>().getOps<func::FuncOp>()) {
-    if (sibling.empty())
-      continue;
-    if (sibling == funcOp)
-      functionIndex = functionCount;
-    ++functionCount;
-  }
-
   Block &block = funcOp.getBody().front();
 
   // ----- Phase 1: liveness analysis ------------------------------------
@@ -767,8 +753,6 @@ void PoolAllocsPass::runOnOperation() {
     // (GenerateInterface) see the attributes regardless of input shape — a
     // missing attribute would crash the metadata reader, while a zeroed one
     // is a well-defined "no pool".
-    if (functionIndex != 0)
-      return;
     ModuleOp moduleOp = funcOp->getParentOfType<ModuleOp>();
     OpBuilder zeroBuilder(funcOp.getContext());
     moduleOp->setAttr("hipdnn.pool_size", zeroBuilder.getI64IntegerAttr(0));
@@ -1091,8 +1075,7 @@ void PoolAllocsPass::runOnOperation() {
     // the pre-multi-domain IR.
     Value pool = hip::GetPoolOp::create(
         builder, loc, poolType, ctx, poolSize,
-        builder.getI64IntegerAttr(
-            static_cast<int64_t>(domainId) * functionCount + functionIndex));
+        builder.getI64IntegerAttr(static_cast<int64_t>(domainId)));
 
     // Per-alloc offsets in this domain's pool. Static offsets are emitted
     // as constants right after the pool; dynamic offsets walk the buckets
@@ -1166,8 +1149,7 @@ void PoolAllocsPass::runOnOperation() {
       auto posIt = allocToPos.find(info->allocOp.getOperation());
       assert(posIt != allocToPos.end() && "alloc missing from allocToPos");
       unsigned pos = posIt->second;
-      bufferDomains[pos] =
-          static_cast<unsigned>(domainId * functionCount + functionIndex);
+      bufferDomains[pos] = static_cast<unsigned>(domainId);
       if (auto constOp = offset.getDefiningOp<arith::ConstantIndexOp>())
         bufferOffsets[pos] = constOp.value();
       else
@@ -1194,11 +1176,6 @@ void PoolAllocsPass::runOnOperation() {
   });
   for (auto op : orphanedDeallocs)
     op.erase();
-
-  // Only the entry function publishes legacy module metadata. Helpers grow
-  // their distinct pools on demand and must not overwrite entry metadata.
-  if (functionIndex != 0)
-    return;
 
   // ----- Module metadata for GenerateInterface -------------------------
   //

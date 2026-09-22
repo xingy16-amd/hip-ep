@@ -1804,25 +1804,6 @@ int wrap_div(RuntimeState *state, void *lhs, void *rhs, void *output,
   return 0;
 }
 
-int wrap_atan2(RuntimeState *state, void *lhs, void *rhs, void *output,
-             int64_t lhs_n, int64_t lhs_c, int64_t lhs_h, int64_t lhs_w,
-             int64_t rhs_n, int64_t rhs_c, int64_t rhs_h, int64_t rhs_w,
-             int64_t out_n, int64_t out_c, int64_t out_h, int64_t out_w,
-             int64_t data_type) {
-  if (!state) {
-    fprintf(stderr, "Invalid state in wrap_atan2\n");
-    return -1;
-  }
-  MOCK_PRINT("[MOCK] wrap_atan2 lhs=[%lld,%lld,%lld,%lld] "
-             "rhs=[%lld,%lld,%lld,%lld] out=[%lld,%lld,%lld,%lld] dtype=%s\n",
-             (long long)lhs_n, (long long)lhs_c, (long long)lhs_h,
-             (long long)lhs_w, (long long)rhs_n, (long long)rhs_c,
-             (long long)rhs_h, (long long)rhs_w, (long long)out_n,
-             (long long)out_c, (long long)out_h, (long long)out_w,
-             hipdnn_ep_datatype_name(data_type));
-  return 0;
-}
-
 int wrap_abs(RuntimeState *state, void *input, void *output,
              int64_t num_elements, int64_t data_type) {
   if (!state) {

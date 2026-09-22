@@ -20,10 +20,8 @@ using namespace mlir;
 int64_t mlir::hip::getStaticByteSize(MemRefType type) {
   if (!type.hasStaticShape())
     return 0;
-  // Memref elements are byte-addressable. In particular i1 is stored as
-  // one byte by the comparison/selection kernels, not packed into bits.
-  int64_t elementBytes = llvm::divideCeil(type.getElementTypeBitWidth(), 8);
-  return type.getNumElements() * elementBytes;
+  int64_t totalBits = type.getNumElements() * type.getElementTypeBitWidth();
+  return static_cast<int64_t>(llvm::divideCeil(totalBits, 8));
 }
 
 Value mlir::hip::emitAlignUp(OpBuilder &builder, Location loc, Value value,
