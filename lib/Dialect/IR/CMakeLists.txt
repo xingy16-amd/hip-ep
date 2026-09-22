@@ -10,6 +10,7 @@ add_library(HipDialectIR STATIC
   HipOpStateInterface.cpp
   HipReifyResultShapesImpl.cpp
   HipShapeUtils.cpp
+  HipTransposeCanonicalize.cpp
 )
 
 add_dependencies(HipDialectIR

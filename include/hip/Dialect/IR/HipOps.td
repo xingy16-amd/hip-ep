@@ -1817,6 +1817,7 @@ def Hip_TransposeOp : Hip_DpsOp<"transpose", /*traits=*/[],
     attr-dict (`:` type($result_tensors)^)?
   }];
   let hasVerifier = 1;
+  let hasCanonicalizer = 1;
 }
 
 def Hip_GatherOp : Hip_DpsOp<"gather", /*traits=*/[],
@@ -3467,41 +3468,25 @@ def Hip_GqaOp : Hip_DpsOp<"gqa",
 
   let assemblyFormat = [{
     `(` $ctx `)` `ins` `(`
-        $query
-        ( `,` $key^ )?
-        ( `,` $value^ )?
-        ( `,` $past_key^ )?
-        ( `,` $past_value^ )?
-        `,` $seqlens_k `,` $total_seq_len
-        ( `,` $cos_cache^ )?
-        ( `,` $sin_cache^ )?
-        ( `,` $position_ids^ )?
-        ( `,` $attention_bias^ )?
-        ( `,` $head_sink^ )?
-        ( `,` $k_scale^ )?
-        ( `,` $v_scale^ )?
-        `:`
-        type($query)
-        ( `,` type($key)^ )?
-        ( `,` type($value)^ )?
-        ( `,` type($past_key)^ )?
-        ( `,` type($past_value)^ )?
-        `,` type($seqlens_k) `,` type($total_seq_len)
-        ( `,` type($cos_cache)^ )?
-        ( `,` type($sin_cache)^ )?
-        ( `,` type($position_ids)^ )?
-        ( `,` type($attention_bias)^ )?
-        ( `,` type($head_sink)^ )?
-        ( `,` type($k_scale)^ )?
-        ( `,` type($v_scale)^ )?
+        $query `,` $seqlens_k `,` $total_seq_len `:`
+        type($query) `,` type($seqlens_k) `,` type($total_seq_len)
     `)`
+    (`key` `(` $key^ `:` type($key) `)`)?
+    (`value` `(` $value^ `:` type($value) `)`)?
+    (`past_key` `(` $past_key^ `:` type($past_key) `)`)?
+    (`past_value` `(` $past_value^ `:` type($past_value) `)`)?
+    (`cos_cache` `(` $cos_cache^ `:` type($cos_cache) `)`)?
+    (`sin_cache` `(` $sin_cache^ `:` type($sin_cache) `)`)?
+    (`position_ids` `(` $position_ids^ `:` type($position_ids) `)`)?
+    (`attention_bias` `(` $attention_bias^ `:` type($attention_bias) `)`)?
+    (`head_sink` `(` $head_sink^ `:` type($head_sink) `)`)?
+    (`k_scale` `(` $k_scale^ `:` type($k_scale) `)`)?
+    (`v_scale` `(` $v_scale^ `:` type($v_scale) `)`)?
     `outs` `(`
-        $output `,` $present_key `,` $present_value
-        ( `,` $output_qk^ )?
-        `:`
+        $output `,` $present_key `,` $present_value `:`
         type($output) `,` type($present_key) `,` type($present_value)
-        ( `,` type($output_qk)^ )?
     `)`
+    (`output_qk` `(` $output_qk^ `:` type($output_qk) `)`)?
     attr-dict (`:` type($result_tensors)^)?
   }];
 
@@ -3737,40 +3722,20 @@ def Hip_MultiHeadAttentionOp : Hip_DpsOp<"multi_head_attention",
   );
 
   let assemblyFormat = [{
-    `(` $ctx `)` `ins` `(`
-        $query
-        ( `,` $key^ )?
-        ( `,` $value^ )?
-        ( `,` $bias^ )?
-        ( `,` $key_padding_mask^ )?
-        ( `,` $attention_bias^ )?
-        ( `,` $past_key^ )?
-        ( `,` $past_value^ )?
-        ( `,` $past_sequence_length^ )?
-        ( `,` $cache_indirection^ )?
-        `:`
-        type($query)
-        ( `,` type($key)^ )?
-        ( `,` type($value)^ )?
-        ( `,` type($bias)^ )?
-        ( `,` type($key_padding_mask)^ )?
-        ( `,` type($attention_bias)^ )?
-        ( `,` type($past_key)^ )?
-        ( `,` type($past_value)^ )?
-        ( `,` type($past_sequence_length)^ )?
-        ( `,` type($cache_indirection)^ )?
-    `)`
-    `outs` `(`
-        $output
-        ( `,` $present_key^ )?
-        ( `,` $present_value^ )?
-        ( `,` $qk^ )?
-        `:`
-        type($output)
-        ( `,` type($present_key)^ )?
-        ( `,` type($present_value)^ )?
-        ( `,` type($qk)^ )?
-    `)`
+    `(` $ctx `)` `ins` `(` $query `:` type($query) `)`
+    (`key` `(` $key^ `:` type($key) `)`)?
+    (`value` `(` $value^ `:` type($value) `)`)?
+    (`bias` `(` $bias^ `:` type($bias) `)`)?
+    (`key_padding_mask` `(` $key_padding_mask^ `:` type($key_padding_mask) `)`)?
+    (`attention_bias` `(` $attention_bias^ `:` type($attention_bias) `)`)?
+    (`past_key` `(` $past_key^ `:` type($past_key) `)`)?
+    (`past_value` `(` $past_value^ `:` type($past_value) `)`)?
+    (`past_sequence_length` `(` $past_sequence_length^ `:` type($past_sequence_length) `)`)?
+    (`cache_indirection` `(` $cache_indirection^ `:` type($cache_indirection) `)`)?
+    `outs` `(` $output `:` type($output) `)`
+    (`present_key` `(` $present_key^ `:` type($present_key) `)`)?
+    (`present_value` `(` $present_value^ `:` type($present_value) `)`)?
+    (`qk` `(` $qk^ `:` type($qk) `)`)?
     attr-dict (`:` type($result_tensors)^)?
   }];
 
@@ -4829,15 +4794,23 @@ def Hip_QuantizeLinearOp : Hip_DpsOp<"quantize_linear", /*traits=*/[],
     the quantization granularity. The quantization formula is
     y = saturate((x / y_scale) + y_zero_point).
 
-    `packed_int4` marks an ONNX INT4 / UINT4 target. `$output` and
-    `$zero_point` keep their i8 / ui8 element type and logical shape, but only
-    the first ceil(numel/2) bytes of `$output` are written: two values per
-    byte, low nibble first, over the flattened row-major sequence. The buffer
-    is still allocated at the logical element count, so its upper half is left
-    untouched, and only a `packed_int4` consumer reads the result correctly.
-    Nothing sets this today -- unlike a packed constant, a 4-bit target leaves
-    no trace in the IR to detect -- and whatever does must first establish that
-    every consumer can be marked as well.
+    `packed_bits` names a sub-byte target: 4 for ONNX INT4 / UINT4, 2 for a
+    2-bit one, and 0 - the default - for a payload that occupies whole bytes.
+    `$output` and `$zero_point` keep their i8 / ui8 element type and logical
+    shape, but only the first ceil(numel * packed_bits / 8) bytes of `$output`
+    are written: 8 / packed_bits values per byte, least significant field
+    first, over the flattened row-major sequence. The buffer is still
+    allocated at the logical element count, so its tail is left untouched, and
+    only a consumer reading the same width recovers the values.
+
+    The width has to be stated rather than derived: every sub-byte payload
+    carries an i8 / ui8 element type at its logical extent, so a 2-bit and a
+    4-bit tensor of the same length are indistinguishable by type, differing
+    only in a byte count the type does not record.
+
+    Nothing sets this today -- unlike a packed constant, a sub-byte target
+    leaves no trace in the IR to detect -- and whatever does must first
+    establish that every consumer can be marked as well.
   }];
 
   let arguments = (ins
@@ -4850,7 +4823,7 @@ def Hip_QuantizeLinearOp : Hip_DpsOp<"quantize_linear", /*traits=*/[],
     I64Attr:$block_size,
     I64Attr:$precision,
     I64Attr:$saturate,
-    UnitAttr:$packed_int4
+    DefaultValuedAttr<I64Attr, "0">:$packed_bits
   );
 
   let assemblyFormat = [{
@@ -4878,14 +4851,24 @@ def Hip_DequantizeLinearOp : Hip_DpsOp<"dequantize_linear", /*traits=*/[],
     or have a rank identical to the input for blocked quantization.
     See QuantizeLinear for details on quantization granularity.
 
-    `packed_int4` marks an ONNX INT4 / UINT4 source. Those import as i8 / ui8
-    at the LOGICAL element count while `$input` and `$zero_point` only hold
-    ceil(numel/2) bytes, two values per byte, low nibble first, over the
-    flattened row-major sequence. The element type keeps the signedness but
-    cannot express the width, so without this flag a consumer reads twice the
-    buffer. `$output` and every shape stay logical, so nothing else changes.
-    Set by convert-onnx-to-hip from the marker that constant lowering stamps
-    on the ONNX op once it sees the halved backing size.
+    `packed_bits` names a sub-byte source: 4 for ONNX INT4 / UINT4, 2 for a
+    2-bit one, and 0 - the default - for a payload that occupies whole bytes.
+    Those import as i8 / ui8 at the LOGICAL element count while `$input` and
+    `$zero_point` only hold ceil(numel * packed_bits / 8) bytes, 8 /
+    packed_bits values per byte, least significant field first, over the
+    flattened row-major sequence.
+
+    The element type keeps the signedness but cannot express the width, and
+    neither can the extent, which stays logical: a 2-bit and a 4-bit tensor of
+    the same length have the same type and differ only in a byte count no
+    operand records. Stating the width is therefore the only way a consumer
+    can read the buffer at all, and the only way one that folds this op into a
+    wider one - `hip.matmul_nbits`, whose own `bits` attribute this feeds -
+    can know what it is folding.
+
+    `$output` and every shape stay logical, so nothing else changes. Set by
+    convert-onnx-to-hip from the marker that constant lowering stamps on the
+    ONNX op once it sees the reduced backing size.
   }];
 
   let arguments = (ins
@@ -4896,7 +4879,7 @@ def Hip_DequantizeLinearOp : Hip_DpsOp<"dequantize_linear", /*traits=*/[],
     Hip_TensorOrMemRef:$output,
     I64Attr:$axis,
     I64Attr:$block_size,
-    UnitAttr:$packed_int4
+    DefaultValuedAttr<I64Attr, "0">:$packed_bits
   );
 
   let assemblyFormat = [{
