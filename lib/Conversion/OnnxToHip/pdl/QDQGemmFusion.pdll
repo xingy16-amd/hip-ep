@@ -22,7 +22,8 @@
 // hip.qgemm has more than one optional operand group, so it needs
 // AttrSizedOperandSegments, and PDL does not synthesize the segment sizes the
 // way an ODS builder would. Each rewrite writes them out; the entries follow
-// the operand declaration order ctx, A, B, B_scales, B_zero_points, C, Y.
+// the operand declaration order ctx, A, B, B_scales, B_zero_points, C,
+// live_seqlens, Y.
 //===----------------------------------------------------------------------===//
 
 Pattern QDQGemm with benefit(10) {
@@ -86,7 +87,7 @@ Pattern QDQGemm with benefit(10) {
 
     let empty = op<tensor.empty> -> (y_type);
     let qgemm = op<hip.qgemm>(ctx, a, b, c, empty.0) {
-      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 0, 0, 1, 1>">,
+      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 0, 0, 1, 0, 1>">,
       A_scale = a_scale_attr,
       A_zero_point = a_zeropoint_attr,
       B_scale = b_scale_attr,
@@ -142,7 +143,7 @@ Pattern QDQGemmNoBias with benefit(10) {
 
     let empty = op<tensor.empty> -> (y_type);
     let qgemm = op<hip.qgemm>(ctx, a, b, empty.0) {
-      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 0, 0, 0, 1>">,
+      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 0, 0, 0, 0, 1>">,
       A_scale = a_scale_attr,
       A_zero_point = a_zeropoint_attr,
       B_scale = b_scale_attr,
@@ -207,7 +208,7 @@ Pattern QDQGemmPerChannelWeight with benefit(9) {
     // B_scale / B_zero_point stay unset: the operands replace them, and their
     // identity defaults are what make M_ab collapse to alpha * A_scale / Y_scale.
     let qgemm = op<hip.qgemm>(ctx, a, b, b_scale, b_zero_point, c, empty.0) {
-      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 1, 1, 1, 1>">,
+      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 1, 1, 1, 0, 1>">,
       A_scale = a_scale_attr,
       A_zero_point = a_zeropoint_attr,
       B_bits = b_bits_attr,
@@ -258,7 +259,7 @@ Pattern QDQGemmNoBiasPerChannelWeight with benefit(9) {
 
     let empty = op<tensor.empty> -> (y_type);
     let qgemm = op<hip.qgemm>(ctx, a, b, b_scale, b_zero_point, empty.0) {
-      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 1, 1, 0, 1>">,
+      operandSegmentSizes = attr<"array<i32: 1, 1, 1, 1, 1, 0, 0, 1>">,
       A_scale = a_scale_attr,
       A_zero_point = a_zeropoint_attr,
       B_bits = b_bits_attr,
