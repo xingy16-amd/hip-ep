@@ -268,6 +268,18 @@ __device__ __forceinline__ int gqa_past_len_from_seqlens(int seqlens_k,
   return past_len < 0 ? 0 : past_len;
 }
 
+// The two lengths a prefill kernel is handed, read from seqlens_k on the
+// device the way gqa_forward_fused reads them on the host: the total is
+// seqlens_k + 1, or just the sq new rows under ORT's negative sentinel, and
+// the past is whatever precedes those rows. A caller that cannot read
+// seqlens_k on the host before it launches -- a D3D12 plan, recorded once
+// for every length -- passes the pointer instead of the two values.
+__device__ __forceinline__ void gqa_prefill_lengths_from_seqlens(
+    int seqlens_k, int sq, int& skv, int& past_len) {
+  skv = seqlens_k < 0 ? sq : seqlens_k + 1;
+  past_len = skv > sq ? skv - sq : 0;
+}
+
 template <typename T>
 __global__ void rope_kernel(
     const T* __restrict__ input,
@@ -2071,7 +2083,15 @@ gqa_flash_decode_wmma_kernel(
     return;
   }
 
+#ifdef HIPDNN_STATIC_LDS
+  // A relocatable build for D3D12, which cannot size LDS at launch: the same
+  // bytes the launcher passes, from the strides used below.
+  __shared__ __attribute__((aligned(16))) char smem_dw[
+      16 * S_STR * sizeof(float) + 2 * BKV * DSTR * sizeof(_Float16) +
+      16 * P_STR * sizeof(_Float16) + 16 * 3 * sizeof(float)];
+#else
   extern __shared__ char smem_dw[];
+#endif
   float*    S_lds = reinterpret_cast<float*>(smem_dw);
   _Float16* K_lds = reinterpret_cast<_Float16*>(smem_dw + 16 * S_STR * sizeof(float));
   _Float16* V_lds = K_lds + BKV * DSTR;
@@ -3180,7 +3200,8 @@ gqa_flash_prefill_v6_kernel(
     float scale,
     const _Float16* __restrict__ head_sink,  // [num_heads] or null
     int num_heads, int smooth_softmax,
-    int local_window_size)                   // <= 0 for full attention
+    int local_window_size,                   // <= 0 for full attention
+    const int* __restrict__ seqlens_k)       // or null: skv/past_len stand
 {
     constexpr int kWmmaTile = 16;
     constexpr int ROWS      = M_TILES * kWmmaTile;
@@ -3227,13 +3248,23 @@ gqa_flash_prefill_v6_kernel(
     const int head_q      = __builtin_amdgcn_readfirstlane(chunk * NW + wave_id);
     const int head_kv     = __builtin_amdgcn_readfirstlane(chunk / cpg);
     const int q_start     = q_tile_idx * ROWS;
+    if (seqlens_k)
+        gqa_prefill_lengths_from_seqlens(seqlens_k[batch], sq, skv, past_len);
 
     const int tid       = threadIdx.x;
     const int lane_id   = tid % 32;
     const int wmma_lane = lane_id % kWmmaTile;
     const int pair      = lane_id / kWmmaTile;
 
+#ifdef HIPDNN_STATIC_LDS
+    // A relocatable build for D3D12, which cannot size LDS at launch: the
+    // same bytes the launcher passes, from the strides used below.
+    __shared__ __attribute__((aligned(16))) char smem_v6[
+        (D * VT_STR + (NW > 1 ? BKV * K_STR : 0) +
+         (Q_LDS ? NW * ROWS * Q_STR : 0)) * sizeof(_Float16)];
+#else
     extern __shared__ char smem_v6[];
+#endif
     _Float16* V_lds = reinterpret_cast<_Float16*>(smem_v6);
     _Float16* K_lds = V_lds + D * VT_STR;        // used only when NW > 1
     _Float16* Q_lds = K_lds + (NW > 1 ? BKV * K_STR : 0) + wave_id * ROWS * Q_STR;
@@ -3609,7 +3640,7 @@ static inline void dispatchPrefillV5(
             <<<grid6, 32 * NW_, smem6, stream>>>(                               \
                 Q, Kcache, Vcache, O, B, Hq, G, sq, skv, max_seq, past_len,     \
                 scale, head_sink, num_heads, smooth_softmax,                    \
-                local_window_size)
+                local_window_size, nullptr)
     #define LAUNCH_V6_D64(MT_, BKV_, HW_)                                       \
         do {                                                                    \
             if (nw == 4)      LAUNCH_V6_NW(MT_, BKV_, 64, HW_, 4);              \
@@ -3757,7 +3788,8 @@ gqa_flash_prefill_v7_kernel(
     const _Float16* __restrict__ Vcache,  // [B, G, max_seq, D]
     _Float16* __restrict__ O,             // [B, sq, Hq, D]
     int B_count, int Hq, int G, int sq, int skv, int max_seq, int past_len,
-    float scale, int ablate)
+    float scale, int ablate,
+    const int* __restrict__ seqlens_k)     // or null: skv/past_len stand
 {
     const int abl = __builtin_amdgcn_readfirstlane(ablate);
     constexpr int kWmmaTile = 16;
@@ -3781,12 +3813,21 @@ gqa_flash_prefill_v7_kernel(
     const int pair      = lane_id / kWmmaTile;       // 0 -> even rows, 1 -> odd
 
     const int q_start   = q_tile_idx * ROWS;
+    if (seqlens_k)
+        gqa_prefill_lengths_from_seqlens(seqlens_k[batch], sq, skv, past_len);
     const int row_base  = q_start + wave_id * MT * kWmmaTile;  // wave's first row
     const int pbase     = wave_id * MT * kWmmaTile;           // wave's P_lds offset
 
     // K streams from global (cache-resident) straight into WMMA fragments; only
     // V (stride-D gather) and the per-wave P transpose need LDS.
+#ifdef HIPDNN_STATIC_LDS
+    // A relocatable build for D3D12, which cannot size LDS at launch: the
+    // same bytes the launcher passes, from the strides used below.
+    __shared__ __attribute__((aligned(16))) char smem_v7[
+        (BKV * KV_STR + ROWS * P_STR) * sizeof(_Float16)];
+#else
     extern __shared__ char smem_v7[];
+#endif
     _Float16* V_lds = reinterpret_cast<_Float16*>(smem_v7);
     _Float16* P_lds = reinterpret_cast<_Float16*>(
         smem_v7 + (size_t)BKV * KV_STR * sizeof(_Float16));
@@ -4005,7 +4046,7 @@ static inline void dispatchPrefillV7(
         gqa_flash_prefill_v7_kernel<NW_, BKV_, D_, MT_>                         \
             <<<grid, NW_ * 32, smem, stream>>>(                                 \
                 Q, Kcache, Vcache, O, B, Hq, G, sq, skv, max_seq, past_len,     \
-                scale, ablate)
+                scale, ablate, nullptr)
     #define DISPATCH_V7_D(D_)                                                   \
         do {                                                                    \
             if (mt == 1) {                                                      \
@@ -4126,7 +4167,8 @@ gqa_flash_prefill_v8_kernel(
     const _Float16* __restrict__ Vcache,  // [B, G, max_seq, D]
     _Float16* __restrict__ O,             // [B, sq, Hq, D]
     int B_count, int Hq, int G, int sq, int skv, int max_seq, int past_len,
-    float scale, int ablate)
+    float scale, int ablate,
+    const int* __restrict__ seqlens_k)     // or null: skv/past_len stand
 {
     const int abl = __builtin_amdgcn_readfirstlane(ablate);
     constexpr int kWmmaTile = 16;
@@ -4157,8 +4199,18 @@ gqa_flash_prefill_v8_kernel(
     const int pair      = lane_id / kWmmaTile;
     const int dt_base   = group * DPG;         // this wave's first D-tile
     const int q_start   = q_tile_idx * ROWS;
+    if (seqlens_k)
+        gqa_prefill_lengths_from_seqlens(seqlens_k[batch], sq, skv, past_len);
 
+#ifdef HIPDNN_STATIC_LDS
+    // A relocatable build for D3D12, which cannot size LDS at launch: the
+    // same bytes the launcher passes, from the strides used below.
+    __shared__ __attribute__((aligned(16))) char smem_v8[
+        BKV * KV_STR * sizeof(_Float16) + ND * ROWS * SP_STR * sizeof(float) +
+        ROWS * P_STR * sizeof(_Float16) + ROWS * sizeof(float)];
+#else
     extern __shared__ char smem_v8[];
+#endif
     _Float16* V_lds  = reinterpret_cast<_Float16*>(smem_v8);
     float*    Sp_lds = reinterpret_cast<float*>(
         smem_v8 + (size_t)BKV * KV_STR * sizeof(_Float16));
@@ -4460,7 +4512,7 @@ static inline void dispatchPrefillV8(
         gqa_flash_prefill_v8_kernel<ND_, MT_, BKV_, 256>                        \
             <<<grid, ND_ * 32, smem, stream>>>(                                 \
                 Q, Kcache, Vcache, O, B, Hq, G, sq, skv, max_seq, past_len,     \
-                scale, ablate)
+                scale, ablate, nullptr)
 
     if      (nd == 2 && mt == 1 && bkv == 32) LAUNCH_V8(2, 1, 32);
     else if (nd == 2 && mt == 2 && bkv == 32) LAUNCH_V8(2, 2, 32);
