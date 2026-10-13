@@ -1790,13 +1790,8 @@ gqa_flash_decode_kernel(
 
   // LDS tiles for K/V (shared across HPG=4 query heads for dedup). 16B-aligned
   // so the cooperative load can move 8 fp16 per float4 (see staging below).
-  // The __half2-vectorized staging below assumes an even EPT. Flash-decode is a
-  // wave32 (RDNA) path only -- wrap_group_query_attention clears fused_supported
-  // on wave64 (hipdnn_device_is_wave64()), so this invariant only needs to hold
-  // there. On wave64 (CDNA/MI350) D=64 yields EPT=1; the kernel is then dead
-  // code that must still compile, so exempt the wave64 device pass.
-  static_assert(EPT % 2 == 0 || WAVE_SIZE != 32,
-                "EPT must be even for __half2 vectorized loads (wave32)");
+  // The per-key reads below move two elements at a time (__half2 / char2) when
+  // EPT is even, and one at a time when it is odd: D = 96 gives each lane 3.
   // HpG==1 (MHA) runs a single wave per block, so the K/V tile in LDS is never
   // reused across waves -- staging is pure overhead (32KB LDS + a __syncthreads
   // every tile). Stream straight from global instead (kStage=false): the LDS
@@ -1906,15 +1901,19 @@ gqa_flash_decode_kernel(
             dot_partial += Q_f[e]     * (float)kk.x + Q_f[e + 1] * (float)kk.y
                          + Q_f[e + 2] * (float)kk.z + Q_f[e + 3] * (float)kk.w;
           }
-        } else {
+        } else if constexpr (EPT % 2 == 0) {
           #pragma unroll
           for (int e = 0; e < EPT; e += 2) {
             const char2 kk =
                 *reinterpret_cast<const char2*>(&Kt[t * D + lane_id * EPT + e]);
             dot_partial += Q_f[e] * (float)kk.x + Q_f[e + 1] * (float)kk.y;
           }
+        } else {
+          #pragma unroll
+          for (int e = 0; e < EPT; ++e)
+            dot_partial += Q_f[e] * (float)Kt[t * D + lane_id * EPT + e];
         }
-      } else {
+      } else if constexpr (EPT % 2 == 0) {
         #pragma unroll
         for (int e = 0; e < EPT; e += 2) {
           const __half2 kk =
@@ -1922,6 +1921,10 @@ gqa_flash_decode_kernel(
           const float2 kf = __half22float2(kk);
           dot_partial += Q_f[e] * kf.x + Q_f[e + 1] * kf.y;
         }
+      } else {
+        #pragma unroll
+        for (int e = 0; e < EPT; ++e)
+          dot_partial += Q_f[e] * __half2float(Kt[t * D + lane_id * EPT + e]);
       }
       // Warp reduce across the wave -> all lanes hold the full dot.
 #pragma unroll
@@ -1947,7 +1950,7 @@ gqa_flash_decode_kernel(
             O_acc[e + 2] = correction * O_acc[e + 2] + p * (float)vv.z;
             O_acc[e + 3] = correction * O_acc[e + 3] + p * (float)vv.w;
           }
-        } else {
+        } else if constexpr (EPT % 2 == 0) {
           #pragma unroll
           for (int e = 0; e < EPT; e += 2) {
             const char2 vv =
@@ -1955,8 +1958,13 @@ gqa_flash_decode_kernel(
             O_acc[e]     = correction * O_acc[e]     + p * (float)vv.x;
             O_acc[e + 1] = correction * O_acc[e + 1] + p * (float)vv.y;
           }
+        } else {
+          #pragma unroll
+          for (int e = 0; e < EPT; ++e)
+            O_acc[e] = correction * O_acc[e] +
+                       p * (float)Vt[t * D + lane_id * EPT + e];
         }
-      } else {
+      } else if constexpr (EPT % 2 == 0) {
         #pragma unroll
         for (int e = 0; e < EPT; e += 2) {
           const __half2 vv =
@@ -1965,6 +1973,11 @@ gqa_flash_decode_kernel(
           O_acc[e]     = correction * O_acc[e]     + p * vf.x;
           O_acc[e + 1] = correction * O_acc[e + 1] + p * vf.y;
         }
+      } else {
+        #pragma unroll
+        for (int e = 0; e < EPT; ++e)
+          O_acc[e] = correction * O_acc[e] +
+                     p * __half2float(Vt[t * D + lane_id * EPT + e]);
       }
       m_acc = m_new;
     }
@@ -2561,6 +2574,7 @@ static inline void launchFlashDecodeConfig(
       do {                                                                     \
         if (d == 256)      LAUNCH_SCALAR_D(256, HPG_);                         \
         else if (d == 128) LAUNCH_SCALAR_D(128, HPG_);                         \
+        else if (d == 96)  LAUNCH_SCALAR_D(96, HPG_);                          \
         else               LAUNCH_SCALAR_D(64, HPG_);                          \
       } while (0)
     switch (hpg) {
@@ -2585,6 +2599,9 @@ static inline void launchFlashDecodeConfig(
         hP, hO, H, hSink, H, use_smooth_softmax, splits);
   else if (d == 128)
     gqa_flash_decode_reduce_kernel<128><<<grid_reduce, 128, 0, stream>>>(
+        hP, hO, H, hSink, H, use_smooth_softmax, splits);
+  else if (d == 96)
+    gqa_flash_decode_reduce_kernel<96><<<grid_reduce, 96, 0, stream>>>(
         hP, hO, H, hSink, H, use_smooth_softmax, splits);
   else
     gqa_flash_decode_reduce_kernel<64><<<grid_reduce, 64, 0, stream>>>(
@@ -2923,9 +2940,9 @@ static int runGqaFlashDecode(
             hpg, H, G);
     return -1;
   }
-  if (d != 64 && d != 128 && d != 256) {
+  if (d != 64 && d != 96 && d != 128 && d != 256) {
     fprintf(stderr,
-            "hip_gqa_flash_decode: unsupported d=%d (must be 64/128/256)\n",
+            "hip_gqa_flash_decode: unsupported d=%d (must be 64/96/128/256)\n",
             d);
     return -1;
   }
@@ -3659,16 +3676,25 @@ static inline void dispatchPrefillV5(
             if (nw == 4) LAUNCH_V6_NW(1, 32, 128, HW_, 4);                      \
             else         LAUNCH_V6_NW(1, 32, 128, HW_, 1);                      \
         } while (0)
+    #define LAUNCH_V6_D96(HW_)                                                  \
+        do {                                                                    \
+            if (nw == 4) LAUNCH_V6_NW(1, 32, 96, HW_, 4);                       \
+            else         LAUNCH_V6_NW(1, 32, 96, HW_, 1);                       \
+        } while (0)
     if (d == 256) {
         if (nw == 4) LAUNCH_V6_NW(1, 16, 256, false, 4);
         else         LAUNCH_V6_NW(1, 16, 256, false, 3);
     } else if (d == 128) {
         if (local_window_size > 0) LAUNCH_V6_D128(true);
         else                       LAUNCH_V6_D128(false);
+    } else if (d == 96) {
+        if (local_window_size > 0) LAUNCH_V6_D96(true);
+        else                       LAUNCH_V6_D96(false);
     } else {
         if (local_window_size > 0) LAUNCH_V6_D64_CFG(true);
         else                       LAUNCH_V6_D64_CFG(false);
     }
+    #undef LAUNCH_V6_D96
     #undef LAUNCH_V6_D128
     #undef LAUNCH_V6_D64_CFG
     #undef LAUNCH_V6_D64
@@ -3680,7 +3706,8 @@ static inline int prefillV5Candidates(int d, PrefillV5Cfg* out) {
     // At d == 128, M_TILES=2 or BKV=64 spills with 4 heads per block (211 to
     // 679 dwords) and measured slower with 1, so M_TILES=1/BKV=32 is the only
     // config built.
-    if (d == 128) {
+    // d == 96 (phi-silica) builds the same single config, untuned.
+    if (d == 128 || d == 96) {
         out[0] = {1, 32};
         return 1;
     }
@@ -3700,7 +3727,7 @@ static inline int prefillV5Candidates(int d, PrefillV5Cfg* out) {
 // The shapes v6 is built for. At d == 256 it runs 3 or 4 heads per block and
 // has no windowed instance.
 static inline bool prefillV6Supports(int d, int Hq, int G, int local_window_size) {
-    if (d == 64 || d == 128) return true;
+    if (d == 64 || d == 96 || d == 128) return true;
     if (d != 256 || G <= 0 || local_window_size > 0) return false;
     const int hpg = Hq / G;
     return hpg % 4 == 0 || hpg % 3 == 0;
@@ -4812,7 +4839,7 @@ extern "C" int hip_gqa_flash_prefill(
     const bool wants_sink   = (head_sink != nullptr) || (smooth_softmax != 0);
     const bool wants_window = local_window_size > 0;
     if (wants_sink && d != 64) return -1;
-    if (wants_window && d != 64 && d != 128) return -1;
+    if (wants_window && d != 64 && d != 96 && d != 128) return -1;
     if (!wants_sink && !wants_window) {
         return hip_gqa_flash_prefill_v2(stream_ptr, Q, Kcache, Vcache, O, B, Hq,
                                         G, sq, skv, d, max_seq, past_len, scale);
@@ -4842,7 +4869,7 @@ extern "C" int hip_gqa_flash_prefill_v2(
     // with 4 it is 1.6x faster. At d == 256 v6 is 1.9x faster than v8 with 4
     // heads per block and 1.3x with 3; with 2 it only matches v8. real/gqa.cpp
     // applies the same rule in lookup mode.
-    if (d == 64 || (d == 128 && G > 0 && (Hq / G) % 4 == 0) ||
+    if (d == 64 || d == 96 || (d == 128 && G > 0 && (Hq / G) % 4 == 0) ||
         (d == 256 && prefillV6Supports(d, Hq, G, 0))) {
         return hip_gqa_flash_prefill_v5_v2(stream_ptr, Q, Kcache, Vcache, O,
                                         B, Hq, G, sq, skv, d, max_seq, past_len,
@@ -4885,7 +4912,7 @@ extern "C" int hip_gqa_flash_prefill_v3_configured(
     const bool wants_sink = head_sink != nullptr || smooth_softmax != 0;
     const bool wants_window = local_window_size > 0;
     if (wants_sink && d != 64) return -1;
-    if (wants_window && d != 64 && d != 128) return -1;
+    if (wants_window && d != 64 && d != 96 && d != 128) return -1;
 
     hipStream_t stream = static_cast<hipStream_t>(stream_ptr);
     const _Float16* Q_ptr = static_cast<const _Float16*>(Q);
@@ -4896,7 +4923,7 @@ extern "C" int hip_gqa_flash_prefill_v3_configured(
     // A PrefillV5 config (m_tiles >= 1) runs v6; at d == 128 a PrefillV7
     // config (m_tiles == 0) runs v7, which has no window, and at d == 256 a
     // PrefillV8 config (m_tiles == 0) runs v8.
-    if (d == 64 || ((d == 128 || d == 256) && m_tiles != 0)) {
+    if (d == 64 || d == 96 || ((d == 128 || d == 256) && m_tiles != 0)) {
         if (!prefillV6Supports(d, Hq, G, local_window_size)) return -1;
         PrefillV5Cfg candidates[8];
         const int count = prefillV5Candidates(d, candidates);

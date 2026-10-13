@@ -179,7 +179,7 @@ static constexpr int kFlashDecodeMaxSplits = 64;
 static inline bool flash_decode_geometry_ok(int64_t H, int64_t G, int64_t d) {
   if (G <= 0)
     return false;
-  if (d != 64 && d != 128 && d != 256)
+  if (d != 64 && d != 96 && d != 128 && d != 256)
     return false;
   int64_t hpg = H / G;
   if (hpg * G != H)
@@ -745,7 +745,8 @@ static int gqa_forward_fused(
   // multiple of 3 or 4 heads (d256 prefill never has a window here).
   // hip_gqa_flash_prefill_v2 applies the same rule when tuning online.
   const bool v6_prefill =
-      d == 64 || (d == 128 && (local_window_size > 0 || (H / G) % 4 == 0)) ||
+      d == 64 || d == 96 ||
+      (d == 128 && (local_window_size > 0 || (H / G) % 4 == 0)) ||
       (d == 256 && ((H / G) % 4 == 0 || (H / G) % 3 == 0));
   const int fused_prefill_version = v6_prefill ? 6 : (d == 128 ? 7 : 8);
   int fp_rc;
@@ -2926,7 +2927,9 @@ int wrap_group_query_attention(
   // Qwen3-family 16:4). For decode, flash_decode_geometry_ok already validates
   // d; for prefill we clamp to the templated set here.
   const bool head_dim_ok =
-      is_decode ? true : (head_dim == 64 || head_dim == 128 || head_dim == 256);
+      is_decode ? true
+                : (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
+                   head_dim == 256);
   // attention_bias (onnx.Attention external mask) is only applied by the legacy
   // decomposed pipeline (Step 8b); the lean fused path would silently drop it,
   // so exclude it here to route masked attention to gqa_forward_hipblaslt
@@ -2942,8 +2945,8 @@ int wrap_group_query_attention(
   const bool sink_ok = !has_smooth_softmax || is_decode || head_dim == 64;
   // Decode handles the window itself (kv_lo clamp), so it is allowed for any
   // supported geometry; prefill implements it at D64 and D128.
-  const bool window_ok =
-      is_decode || local_window_size <= 0 || head_dim == 64 || head_dim == 128;
+  const bool window_ok = is_decode || local_window_size <= 0 ||
+                         head_dim == 64 || head_dim == 96 || head_dim == 128;
   // The whole fused path (gqa_forward_fused, including the sink and windowed
   // prefill kernels above) is built on the RDNA-only WMMA intrinsics, which
   // trap on CDNA (wave64, e.g. MI350). Route wave64 to the decomposed hipBLASLt
